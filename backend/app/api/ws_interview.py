@@ -1,0 +1,514 @@
+"""
+WebSocket endpoint for live interview sessions.
+Handles: audio chunks in -> transcript + AI insights out.
+Supports Volcano Engine streaming ASR (PCM) and AI Builder Space fallback (WebM).
+"""
+
+import asyncio
+import json
+import logging
+import re
+import struct
+import time
+from typing import Dict, Any, Optional
+
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+
+from app.database import async_session
+from app.models.db_models import TranscriptEntry, AIInsight
+from app.services.transcription import TranscriptionService
+from app.services.copilot import CopilotEngine
+from app.services.memory import MemoryStore
+from app.services.stt_router import use_volcengine, create_volcengine_client, _is_webm
+from app.services.stt_volcengine import VolcEngineStreamingClient
+from app.services.global_context import global_context_store
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+active_copilots: Dict[str, CopilotEngine] = {}
+_active_ws: Dict[str, WebSocket] = {}
+_session_generation: Dict[str, int] = {}
+
+# PCM silence threshold — matches the frontend AudioWorklet VAD_ENERGY_THRESHOLD
+_SILENCE_ENERGY_THRESHOLD = 0.005
+# Higher threshold for AI Builder path — Whisper hallucinates more on low-energy noise
+_AI_BUILDER_SILENCE_THRESHOLD = 0.02
+
+_WHISPER_HALLUCINATION_PATTERNS = [
+    re.compile(r"(风声|噪音|噪声|杂音|干扰).{0,8}(太大|很大|较大|严重)"),
+    re.compile(r"没有听到.{0,6}(清晰|有效|任何)"),
+    re.compile(r"(请您?|建议).{0,10}(调整|检查).{0,6}(麦克风|话筒|环境|设备)"),
+    re.compile(r"(目前|当前|暂时).{0,8}(没有|无法).{0,8}(听到|识别|检测)"),
+    re.compile(r"(听到|检测到).{0,6}(一些|有些).{0,8}(噪音|杂音|干扰|背景)"),
+    re.compile(r"继续说话"),
+    re.compile(r"音频.{0,6}(不清晰|质量|问题)"),
+    re.compile(r"^(谢谢|感谢).{0,4}(收看|观看|聆听|收听)"),
+    re.compile(r"字幕"),
+]
+
+
+def _is_whisper_hallucination(text: str) -> bool:
+    """Detect common Whisper hallucination patterns (meta-commentary about audio quality)."""
+    return any(p.search(text) for p in _WHISPER_HALLUCINATION_PATTERNS)
+
+
+def _pcm_is_silence(pcm: bytes, threshold: float = _SILENCE_ENERGY_THRESHOLD) -> bool:
+    """Return True if the PCM16-LE audio frame is below the energy threshold."""
+    if len(pcm) < 2:
+        return True
+    n_samples = len(pcm) // 2
+    samples = struct.unpack(f"<{n_samples}h", pcm[:n_samples * 2])
+    energy = sum(s * s for s in samples) / n_samples / (32768.0 * 32768.0)
+    return energy < threshold
+
+
+@router.websocket("/ws/interview/{session_id}")
+async def interview_ws(websocket: WebSocket, session_id: str):
+    await websocket.accept()
+    logger.info("WebSocket connected for session %s", session_id)
+
+    # --- Generation counter: prevents StrictMode race ---
+    prev_ws = _active_ws.get(session_id)
+    if prev_ws is not None:
+        logger.info("Closing stale WebSocket for session %s (StrictMode re-mount)", session_id)
+        try:
+            await prev_ws.close(code=1000, reason="superseded")
+        except Exception:
+            pass
+    gen = _session_generation.get(session_id, 0) + 1
+    _session_generation[session_id] = gen
+    _active_ws[session_id] = websocket
+
+    def _is_stale() -> bool:
+        return _session_generation.get(session_id) != gen
+
+    transcription_svc = TranscriptionService()
+    memory = MemoryStore()
+
+    copilot = active_copilots.get(session_id) or CopilotEngine()
+    active_copilots[session_id] = copilot
+
+    # Load global context (company values, project background) + per-session candidate
+    from app.api.routes_context import get_context_manager  # lazy to avoid circular import
+    gc = global_context_store.load()
+    cm = get_context_manager(session_id)
+    copilot.load_context(
+        company_values=gc.get("company_values", ""),
+        project_background=gc.get("project_background", ""),
+        candidate_profile=str(cm.candidate_profile) if cm else "",
+    )
+    logger.info(
+        "Copilot context loaded for session %s: cv=%d chars, pb=%d chars, cp=%d chars",
+        session_id,
+        len(copilot.company_values),
+        len(copilot.project_background),
+        len(copilot.candidate_profile),
+    )
+
+    session_start = time.time()
+    current_speaker = "interviewer"
+    analysis_counter = 0
+    ANALYSIS_INTERVAL = 3
+    transcription_error_count = 0
+
+    volc_client: Optional[VolcEngineStreamingClient] = None
+    volc_connected = False
+    last_volc_audio_time = 0.0
+    volc_keepalive_task: Optional[asyncio.Task] = None
+    VOLC_KEEPALIVE_INTERVAL = 8.0  # seconds between keepalive checks
+    VOLC_KEEPALIVE_STALE = 5.0     # send keepalive if no audio for this long
+    VOLC_SILENCE_PACKET = b"\x00" * 640  # 20ms of silence PCM16@16kHz mono
+
+    # AI Builder audio buffer — accumulate short PCM chunks before transcribing
+    # to avoid Whisper hallucination on short audio clips.
+    MIN_AI_BUILDER_BYTES = 96_000  # ~3s of PCM16@16kHz mono
+    FLUSH_SILENCE_SECS = 2.0      # flush after this silence gap
+    ai_builder_buf = bytearray()
+    ai_builder_last_chunk_time = 0.0
+    flush_timer_task: Optional[asyncio.Task] = None
+
+    # --- AI Builder buffer flush helper ---
+    async def _flush_ai_builder_buf():
+        nonlocal ai_builder_buf, analysis_counter, transcription_error_count
+        if not ai_builder_buf:
+            return
+        audio_snapshot = bytes(ai_builder_buf)
+        ai_builder_buf.clear()
+        elapsed = round(time.time() - session_start, 2)
+        logger.debug("Flushing AI Builder buffer: %d bytes (t=%.1fs)", len(audio_snapshot), elapsed)
+        result = await transcription_svc.transcribe(audio_snapshot)
+        err = result.get("error")
+        if err:
+            transcription_error_count += 1
+            logger.warning("Transcription error #%d: %s", transcription_error_count, err)
+            await websocket.send_json({
+                "type": "transcription_error",
+                "payload": {"error": err, "count": transcription_error_count},
+            })
+            return
+        text = result.get("text", "").strip()
+        if not text:
+            logger.debug("Transcription returned empty text (silence?)")
+            return
+        if _is_whisper_hallucination(text):
+            logger.info("Filtered Whisper hallucination: %s", text[:80])
+            return
+        logger.info("Transcribed [%s]: %s", current_speaker, text[:80])
+        entry_id = await _persist_transcript(
+            session_id, current_speaker, text, elapsed, copilot, memory,
+        )
+        await websocket.send_json({
+            "type": "transcript",
+            "payload": {"id": entry_id, "speaker": current_speaker, "text": text, "time": elapsed},
+        })
+        analysis_counter += 1
+        if analysis_counter >= ANALYSIS_INTERVAL and copilot.available:
+            analysis_counter = 0
+            asyncio.create_task(_run_analysis(websocket, copilot, session_id))
+
+    async def _silence_flush_timer():
+        """Background task: flush the AI Builder buffer after a silence gap."""
+        await asyncio.sleep(FLUSH_SILENCE_SECS)
+        await _flush_ai_builder_buf()
+
+    async def _volc_keepalive_loop():
+        """Send periodic silence packets to VolcEngine to prevent server-side session timeout."""
+        nonlocal volc_connected
+        while volc_connected and volc_client:
+            await asyncio.sleep(VOLC_KEEPALIVE_INTERVAL)
+            if not volc_connected or not volc_client:
+                break
+            idle = time.time() - last_volc_audio_time
+            if idle >= VOLC_KEEPALIVE_STALE:
+                try:
+                    await volc_client.send_audio(VOLC_SILENCE_PACKET)
+                    logger.debug("VolcEngine keepalive sent (idle=%.1fs)", idle)
+                except Exception:
+                    logger.warning("VolcEngine keepalive failed, marking disconnected")
+                    volc_connected = False
+                    try:
+                        await websocket.send_json({
+                            "type": "stt_provider",
+                            "payload": {"provider": "ai_builder", "status": "fallback"},
+                        })
+                    except Exception:
+                        pass
+                    break
+
+    # Callback closures for Volcano Engine streaming results
+    async def _on_volc_text(text: str, definite: bool):
+        nonlocal analysis_counter
+        elapsed = round(time.time() - session_start, 2)
+        if definite:
+            entry_id = None
+            async with async_session() as db:
+                entry = TranscriptEntry(
+                    session_id=session_id,
+                    speaker=current_speaker,
+                    text=text,
+                    start_time=elapsed,
+                )
+                db.add(entry)
+                await db.commit()
+                await db.refresh(entry)
+                entry_id = entry.id
+            copilot.add_transcript(current_speaker, text)
+            if current_speaker == "interviewer":
+                memory.add_question(text, session_id)
+            await websocket.send_json({
+                "type": "transcript",
+                "payload": {"id": entry_id, "speaker": current_speaker, "text": text, "time": elapsed},
+            })
+            analysis_counter += 1
+            if analysis_counter >= ANALYSIS_INTERVAL and copilot.available:
+                analysis_counter = 0
+                asyncio.create_task(_run_analysis(websocket, copilot, session_id))
+        else:
+            await websocket.send_json({
+                "type": "transcript_partial",
+                "payload": {"speaker": current_speaker, "text": text, "time": elapsed},
+            })
+
+    def _on_volc_result_sync(text: str, definite: bool = False):
+        asyncio.create_task(_on_volc_text(text, definite))
+
+    def _on_volc_error(err: str):
+        nonlocal volc_connected
+        logger.error("VolcEngine ASR error: %s", err)
+        volc_connected = False
+        try:
+            asyncio.create_task(websocket.send_json({
+                "type": "stt_provider",
+                "payload": {"provider": "ai_builder", "status": "fallback"},
+            }))
+        except Exception:
+            pass
+
+    # Try to set up Volcano Engine streaming client
+    volc_client = create_volcengine_client(
+        on_result=_on_volc_result_sync,
+        on_error=_on_volc_error,
+    )
+
+    try:
+        # Checkpoint 1: bail out before expensive VolcEngine connect
+        if _is_stale():
+            logger.info("Stale handler (gen %d) for session %s, bailing out before connect", gen, session_id)
+            return
+
+        if volc_client:
+            try:
+                await volc_client.connect()
+
+                # Checkpoint 2: bail out if superseded during the connect() await
+                if _is_stale():
+                    logger.info("Stale handler (gen %d) for session %s, bailing out after connect", gen, session_id)
+                    await volc_client.close()
+                    return
+
+                volc_connected = True
+                last_volc_audio_time = time.time()
+                volc_keepalive_task = asyncio.create_task(_volc_keepalive_loop())
+                logger.info("VolcEngine ASR connected for session %s", session_id)
+                await websocket.send_json({
+                    "type": "stt_provider",
+                    "payload": {"provider": "volcengine", "status": "connected"},
+                })
+            except (WebSocketDisconnect, RuntimeError):
+                raise
+            except Exception:
+                logger.exception("VolcEngine ASR connect failed, falling back to AI Builder Space")
+                volc_client = None
+                volc_connected = False
+                await websocket.send_json({
+                    "type": "stt_provider",
+                    "payload": {"provider": "ai_builder", "status": "fallback"},
+                })
+        else:
+            await websocket.send_json({
+                "type": "stt_provider",
+                "payload": {"provider": "ai_builder", "status": "active"},
+            })
+
+        # Checkpoint 3: bail out before entering main loop
+        if _is_stale():
+            logger.info("Stale handler (gen %d) for session %s, bailing out before main loop", gen, session_id)
+            return
+
+        # Generate opening suggestions in background so the WS loop starts immediately
+        if copilot.available and copilot.has_context and not copilot.transcript_buffer:
+            asyncio.create_task(
+                _send_opening_suggestions(websocket, copilot, session_id)
+            )
+
+        while True:
+            raw = await websocket.receive()
+
+            if raw.get("type") == "websocket.disconnect":
+                break
+
+            if "bytes" in raw and raw["bytes"]:
+                audio_data = raw["bytes"]
+                elapsed = round(time.time() - session_start, 2)
+                fmt = "WebM" if _is_webm(audio_data) else "PCM"
+
+                if volc_connected and volc_client and use_volcengine(audio_data):
+                    logger.debug("Audio %s %dB -> VolcEngine (t=%.1fs)", fmt, len(audio_data), elapsed)
+                    try:
+                        await volc_client.send_audio(audio_data)
+                        last_volc_audio_time = time.time()
+                    except Exception:
+                        logger.exception("VolcEngine send_audio failed, falling back to AI Builder")
+                        volc_connected = False
+                        try:
+                            await websocket.send_json({
+                                "type": "stt_provider",
+                                "payload": {"provider": "ai_builder", "status": "fallback"},
+                            })
+                        except Exception:
+                            pass
+                else:
+                    # WebM blobs (MediaRecorder) are already substantial; send directly.
+                    # PCM 200ms chunks must be accumulated to avoid Whisper hallucination.
+                    if _is_webm(audio_data):
+                        logger.debug("Audio WebM %dB -> AI Builder direct (t=%.1fs)", len(audio_data), elapsed)
+                        result = await transcription_svc.transcribe(audio_data)
+                        err = result.get("error")
+                        if err:
+                            transcription_error_count += 1
+                            logger.warning("Transcription error #%d: %s", transcription_error_count, err)
+                            await websocket.send_json({
+                                "type": "transcription_error",
+                                "payload": {"error": err, "count": transcription_error_count},
+                            })
+                            continue
+                        text = result.get("text", "").strip()
+                        if not text:
+                            continue
+                        if _is_whisper_hallucination(text):
+                            logger.info("Filtered Whisper hallucination: %s", text[:80])
+                            continue
+                        logger.info("Transcribed [%s]: %s", current_speaker, text[:80])
+                        entry_id = await _persist_transcript(
+                            session_id, current_speaker, text, elapsed, copilot, memory,
+                        )
+                        await websocket.send_json({
+                            "type": "transcript",
+                            "payload": {"id": entry_id, "speaker": current_speaker, "text": text, "time": elapsed},
+                        })
+                        analysis_counter += 1
+                        if analysis_counter >= ANALYSIS_INTERVAL and copilot.available:
+                            analysis_counter = 0
+                            asyncio.create_task(_run_analysis(websocket, copilot, session_id))
+                    else:
+                        # Stricter silence gate for AI Builder to prevent Whisper hallucination
+                        if _pcm_is_silence(audio_data, _AI_BUILDER_SILENCE_THRESHOLD):
+                            continue
+                        logger.debug("Audio PCM %dB -> AI Builder buffer (buf=%dB, t=%.1fs)",
+                                     len(audio_data), len(ai_builder_buf), elapsed)
+                        ai_builder_buf.extend(audio_data)
+                        ai_builder_last_chunk_time = time.time()
+                        if flush_timer_task and not flush_timer_task.done():
+                            flush_timer_task.cancel()
+                        if len(ai_builder_buf) >= MIN_AI_BUILDER_BYTES:
+                            await _flush_ai_builder_buf()
+                        else:
+                            flush_timer_task = asyncio.create_task(_silence_flush_timer())
+
+            elif "text" in raw and raw["text"]:
+                try:
+                    msg = json.loads(raw["text"])
+                except json.JSONDecodeError:
+                    continue
+
+                msg_type = msg.get("type", "")
+
+                if msg_type == "speaker_toggle":
+                    current_speaker = msg.get(
+                        "speaker",
+                        "candidate" if current_speaker == "interviewer" else "interviewer",
+                    )
+                    await websocket.send_json({"type": "speaker_changed", "payload": {"speaker": current_speaker}})
+
+                elif msg_type == "manual_transcript":
+                    text = (msg.get("text") or "").strip()
+                    speaker = msg.get("speaker") or current_speaker
+                    if text:
+                        elapsed = round(time.time() - session_start, 2)
+                        logger.info("Manual transcript [%s]: %s", speaker, text[:80])
+                        entry_id = await _persist_transcript(
+                            session_id, speaker, text, elapsed, copilot, memory,
+                        )
+                        await websocket.send_json({
+                            "type": "transcript",
+                            "payload": {"id": entry_id, "speaker": speaker, "text": text, "time": elapsed},
+                        })
+                        analysis_counter += 1
+                        if analysis_counter >= ANALYSIS_INTERVAL and copilot.available:
+                            analysis_counter = 0
+                            asyncio.create_task(_run_analysis(websocket, copilot, session_id))
+
+                elif msg_type == "request_analysis":
+                    if copilot.available:
+                        asyncio.create_task(_run_analysis(websocket, copilot, session_id))
+
+                elif msg_type == "ping":
+                    await websocket.send_json({"type": "pong"})
+
+    except (WebSocketDisconnect, RuntimeError):
+        logger.info("WebSocket disconnected for session %s", session_id)
+    except Exception:
+        logger.exception("WebSocket error for session %s", session_id)
+    finally:
+        if volc_keepalive_task and not volc_keepalive_task.done():
+            volc_keepalive_task.cancel()
+        if flush_timer_task and not flush_timer_task.done():
+            flush_timer_task.cancel()
+        if not _is_stale():
+            try:
+                await _flush_ai_builder_buf()
+            except Exception:
+                pass
+            active_copilots.pop(session_id, None)
+        if _active_ws.get(session_id) is websocket:
+            _active_ws.pop(session_id, None)
+        if volc_client:
+            try:
+                await volc_client.close()
+            except Exception:
+                pass
+
+
+async def _persist_transcript(
+    session_id: str, speaker: str, text: str, elapsed: float,
+    copilot: CopilotEngine, memory: MemoryStore,
+) -> Optional[str]:
+    """Save transcript entry to DB, feed copilot + memory. Returns entry_id."""
+    entry_id = None
+    async with async_session() as db:
+        entry = TranscriptEntry(
+            session_id=session_id,
+            speaker=speaker,
+            text=text,
+            start_time=elapsed,
+        )
+        db.add(entry)
+        await db.commit()
+        await db.refresh(entry)
+        entry_id = entry.id
+    copilot.add_transcript(speaker, text)
+    if speaker == "interviewer":
+        memory.add_question(text, session_id)
+    return entry_id
+
+
+async def _send_opening_suggestions(
+    websocket: WebSocket, copilot: CopilotEngine, session_id: str,
+):
+    """Generate opening suggestions from context and send via WebSocket (background task)."""
+    try:
+        logger.info("Generating opening suggestions for session %s ...", session_id)
+        opening = await copilot.generate_opening_suggestions()
+        if opening:
+            async with async_session() as db:
+                for s in opening:
+                    insight = AIInsight(
+                        session_id=session_id,
+                        insight_type=s.get("type", "opening_question"),
+                        content=s.get("content", ""),
+                    )
+                    db.add(insight)
+                await db.commit()
+            await websocket.send_json({
+                "type": "copilot_suggestions",
+                "payload": {"suggestions": opening},
+            })
+            logger.info("Sent %d opening suggestions for session %s", len(opening), session_id)
+        else:
+            logger.warning("No opening suggestions generated for session %s", session_id)
+    except Exception:
+        logger.exception("Opening suggestions failed for session %s", session_id)
+
+
+async def _run_analysis(websocket: WebSocket, copilot: CopilotEngine, session_id: str):
+    """Run copilot analysis and send suggestions via WebSocket."""
+    try:
+        suggestions = await copilot.analyse()
+        if suggestions:
+            async with async_session() as db:
+                for s in suggestions:
+                    insight = AIInsight(
+                        session_id=session_id,
+                        insight_type=s.get("type", "general"),
+                        content=s.get("content", ""),
+                    )
+                    db.add(insight)
+                await db.commit()
+
+            await websocket.send_json({
+                "type": "copilot_suggestions",
+                "payload": {"suggestions": suggestions},
+            })
+    except Exception:
+        logger.exception("Analysis push failed")
