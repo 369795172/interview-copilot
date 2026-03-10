@@ -143,9 +143,29 @@ class CopilotEngine:
     def has_context(self) -> bool:
         return bool(self.candidate_profile or self.company_values or self.project_background)
 
+    @staticmethod
+    def _parse_llm_json(raw: str, fallback: Any = None) -> Any:
+        """Parse LLM output as JSON, stripping markdown fences and handling errors gracefully."""
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
+            if raw.endswith("```"):
+                raw = raw[:-3]
+            raw = raw.strip()
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("LLM returned non-JSON (first 200 chars): %s", raw[:200])
+            return fallback
+
     async def generate_opening_suggestions(self) -> List[Dict[str, Any]]:
         """Generate opening questions and strategy from context alone (no transcript needed)."""
-        if not self.available or not self.has_context:
+        if not self.available:
+            logger.warning("Opening suggestions skipped: LLM not available")
+            return []
+        if not self.has_context:
+            logger.warning("Opening suggestions skipped: no context (cv=%d, company=%d, project=%d)",
+                           len(self.candidate_profile), len(self.company_values), len(self.project_background))
             return []
 
         prompt = OPENING_SUGGESTIONS_PROMPT.format(
@@ -163,14 +183,7 @@ class CopilotEngine:
                 max_tokens=settings.llm_max_tokens,
             )
             raw = resp.choices[0].message.content or "[]"
-            # Strip markdown fences if the model wraps the JSON
-            raw = raw.strip()
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
-                if raw.endswith("```"):
-                    raw = raw[:-3]
-                raw = raw.strip()
-            parsed = json.loads(raw)
+            parsed = self._parse_llm_json(raw, fallback=[])
             if isinstance(parsed, dict):
                 parsed = parsed.get("suggestions", [parsed])
             suggestions = parsed if isinstance(parsed, list) else [parsed]
@@ -223,7 +236,7 @@ class CopilotEngine:
                 max_tokens=settings.llm_max_tokens,
             )
             raw = resp.choices[0].message.content or "[]"
-            parsed = json.loads(raw)
+            parsed = self._parse_llm_json(raw, fallback=[])
             if isinstance(parsed, dict):
                 parsed = parsed.get("suggestions", [parsed])
             return parsed if isinstance(parsed, list) else [parsed]
@@ -249,7 +262,7 @@ class CopilotEngine:
                 max_tokens=1024,
             )
             raw = resp.choices[0].message.content or "[]"
-            parsed = json.loads(raw)
+            parsed = self._parse_llm_json(raw, fallback=[])
             if isinstance(parsed, dict):
                 parsed = parsed.get("questions", [parsed])
             return parsed if isinstance(parsed, list) else [parsed]
@@ -280,7 +293,8 @@ class CopilotEngine:
                 max_tokens=512,
             )
             raw = resp.choices[0].message.content or "{}"
-            return json.loads(raw)
+            result = self._parse_llm_json(raw, fallback={"suggested_score": None, "reasoning": "LLM returned non-JSON"})
+            return result
         except Exception:
             logger.exception("Score suggestion failed")
             return {"suggested_score": None, "reasoning": "Analysis failed"}

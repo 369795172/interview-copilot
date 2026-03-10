@@ -19,7 +19,7 @@ class ContextManager:
     def __init__(self):
         self.company_values: str = ""
         self.project_background: str = ""
-        self.candidate_profile: Dict[str, Any] = {}
+        self.candidate_profile: str = ""  # Now stores raw_text instead of dict
         self.evaluation_framework: Optional[Dict[str, Any]] = None
         self.custom_notes: str = ""
 
@@ -48,7 +48,8 @@ class ContextManager:
     async def load_candidate_file(self, file_path: str, file_name: str) -> Dict[str, Any]:
         """Parse an uploaded candidate file (PDF / MD / DOCX)."""
         profile = parse_resume(file_path, file_name)
-        self.candidate_profile = profile
+        # Fix: store raw_text content instead of the whole dict
+        self.candidate_profile = profile.get("raw_text", "") if isinstance(profile, dict) else str(profile)
         return profile
 
     def set_custom_notes(self, notes: str):

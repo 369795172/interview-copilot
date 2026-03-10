@@ -41,9 +41,9 @@ export default function CopilotPanel({ suggestions, sessionId }) {
 
         {/* Suggestions */}
         {suggestions.length === 0 && (
-          <p style={{ color: "var(--text-dim)", textAlign: "center", padding: "2rem 1rem", fontSize: "0.85rem" }}>
-            AI suggestions will appear here during the interview...
-          </p>
+          <div style={{ padding: "1rem", color: "var(--text-dim)", textAlign: "center" }}>
+            {coverage ? "正在生成面试建议..." : "请先上传候选人简历"}
+          </div>
         )}
         {suggestions.map((s, i) => {
           const Icon = ICON_MAP[s.type] || Sparkles;

@@ -47,6 +47,7 @@ export default function LiveInterview() {
 
   const toggleSpeaker = () => {
     const next = currentSpeaker === "interviewer" ? "candidate" : "interviewer";
+    console.log("[Speaker] toggle %s -> %s", currentSpeaker, next);
     setCurrentSpeaker(next);
     sendMessage({ type: "speaker_toggle", speaker: next });
   };

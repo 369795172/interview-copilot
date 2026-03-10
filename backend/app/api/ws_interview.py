@@ -107,7 +107,10 @@ async def interview_ws(websocket: WebSocket, session_id: str):
     )
 
     session_start = time.time()
-    current_speaker = "interviewer"
+    speaker_state = {"current": "interviewer"}
+    volc_partial = {"text": "", "full_len": 0}
+    volc_consumed = {"offset": 0}
+    skip_volc_definitive = {"flag": False}
     analysis_counter = 0
     ANALYSIS_INTERVAL = 3
     transcription_error_count = 0
@@ -154,13 +157,14 @@ async def interview_ws(websocket: WebSocket, session_id: str):
         if _is_whisper_hallucination(text):
             logger.info("Filtered Whisper hallucination: %s", text[:80])
             return
-        logger.info("Transcribed [%s]: %s", current_speaker, text[:80])
+        spk = speaker_state["current"]
+        logger.info("Transcribed [%s]: %s", spk, text[:80])
         entry_id = await _persist_transcript(
-            session_id, current_speaker, text, elapsed, copilot, memory,
+            session_id, spk, text, elapsed, copilot, memory,
         )
         await websocket.send_json({
             "type": "transcript",
-            "payload": {"id": entry_id, "speaker": current_speaker, "text": text, "time": elapsed},
+            "payload": {"id": entry_id, "speaker": spk, "text": text, "time": elapsed},
         })
         analysis_counter += 1
         if analysis_counter >= ANALYSIS_INTERVAL and copilot.available:
@@ -196,38 +200,72 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                         pass
                     break
 
-    # Callback closures for Volcano Engine streaming results
+    # Callback closures for Volcano Engine streaming results.
+    # VolcEngine BigModel ASR produces cumulative text — each result contains ALL
+    # recognised text from the start of the stream. We track volc_consumed["offset"]
+    # so we only process the delta (new text since last committed position).
+    _PUNCT_STRIP = " \t\n。，、？！.?!,;；：:"
+
     async def _on_volc_text(text: str, definite: bool):
         nonlocal analysis_counter
+        spk = speaker_state["current"]
         elapsed = round(time.time() - session_start, 2)
+
+        # Handle offset reset (e.g. VolcEngine reconnected with fresh stream)
+        if volc_consumed["offset"] > len(text):
+            volc_consumed["offset"] = 0
+
+        new_text = text[volc_consumed["offset"]:].lstrip(_PUNCT_STRIP).strip()
+
         if definite:
+            if skip_volc_definitive["flag"]:
+                logger.info("Skipping stale VolcEngine definitive after speaker switch (offset %d->%d): %s",
+                            volc_consumed["offset"], len(text), text[:80])
+                skip_volc_definitive["flag"] = False
+                volc_consumed["offset"] = len(text)
+                volc_partial["text"] = ""
+                volc_partial["full_len"] = 0
+                return
+
+            volc_consumed["offset"] = len(text)
+            volc_partial["text"] = ""
+            volc_partial["full_len"] = 0
+
+            if not new_text:
+                return
+
+            logger.info("VolcEngine transcribed [%s]: %s", spk, new_text[:80])
             entry_id = None
             async with async_session() as db:
                 entry = TranscriptEntry(
                     session_id=session_id,
-                    speaker=current_speaker,
-                    text=text,
+                    speaker=spk,
+                    text=new_text,
                     start_time=elapsed,
                 )
                 db.add(entry)
                 await db.commit()
                 await db.refresh(entry)
                 entry_id = entry.id
-            copilot.add_transcript(current_speaker, text)
-            if current_speaker == "interviewer":
-                memory.add_question(text, session_id)
+            copilot.add_transcript(spk, new_text)
+            if spk == "interviewer":
+                memory.add_question(new_text, session_id)
             await websocket.send_json({
                 "type": "transcript",
-                "payload": {"id": entry_id, "speaker": current_speaker, "text": text, "time": elapsed},
+                "payload": {"id": entry_id, "speaker": spk, "text": new_text, "time": elapsed},
             })
             analysis_counter += 1
             if analysis_counter >= ANALYSIS_INTERVAL and copilot.available:
                 analysis_counter = 0
                 asyncio.create_task(_run_analysis(websocket, copilot, session_id))
         else:
+            volc_partial["text"] = new_text
+            volc_partial["full_len"] = len(text)
+            if not new_text:
+                return
             await websocket.send_json({
                 "type": "transcript_partial",
-                "payload": {"speaker": current_speaker, "text": text, "time": elapsed},
+                "payload": {"speaker": spk, "text": new_text, "time": elapsed},
             })
 
     def _on_volc_result_sync(text: str, definite: bool = False):
@@ -349,13 +387,14 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                         if _is_whisper_hallucination(text):
                             logger.info("Filtered Whisper hallucination: %s", text[:80])
                             continue
-                        logger.info("Transcribed [%s]: %s", current_speaker, text[:80])
+                        spk = speaker_state["current"]
+                        logger.info("Transcribed [%s]: %s", spk, text[:80])
                         entry_id = await _persist_transcript(
-                            session_id, current_speaker, text, elapsed, copilot, memory,
+                            session_id, spk, text, elapsed, copilot, memory,
                         )
                         await websocket.send_json({
                             "type": "transcript",
-                            "payload": {"id": entry_id, "speaker": current_speaker, "text": text, "time": elapsed},
+                            "payload": {"id": entry_id, "speaker": spk, "text": text, "time": elapsed},
                         })
                         analysis_counter += 1
                         if analysis_counter >= ANALYSIS_INTERVAL and copilot.available:
@@ -385,15 +424,45 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                 msg_type = msg.get("type", "")
 
                 if msg_type == "speaker_toggle":
-                    current_speaker = msg.get(
+                    old_spk = speaker_state["current"]
+                    new_spk = msg.get(
                         "speaker",
-                        "candidate" if current_speaker == "interviewer" else "interviewer",
+                        "candidate" if old_spk == "interviewer" else "interviewer",
                     )
-                    await websocket.send_json({"type": "speaker_changed", "payload": {"speaker": current_speaker}})
+
+                    if flush_timer_task and not flush_timer_task.done():
+                        flush_timer_task.cancel()
+
+                    if ai_builder_buf:
+                        await _flush_ai_builder_buf()
+
+                    if volc_partial["text"]:
+                        elapsed = round(time.time() - session_start, 2)
+                        logger.info("Committing VolcEngine partial on speaker switch [%s]: %s",
+                                    old_spk, volc_partial["text"][:80])
+                        entry_id = await _persist_transcript(
+                            session_id, old_spk, volc_partial["text"], elapsed, copilot, memory,
+                        )
+                        await websocket.send_json({
+                            "type": "transcript",
+                            "payload": {"id": entry_id, "speaker": old_spk,
+                                        "text": volc_partial["text"], "time": elapsed},
+                        })
+                        volc_consumed["offset"] = volc_partial["full_len"]
+                        volc_partial["text"] = ""
+                        volc_partial["full_len"] = 0
+                        skip_volc_definitive["flag"] = True
+
+                    speaker_state["current"] = new_spk
+                    logger.info("Speaker toggle: %s -> %s", old_spk, new_spk)
+                    await websocket.send_json({
+                        "type": "speaker_changed",
+                        "payload": {"speaker": new_spk},
+                    })
 
                 elif msg_type == "manual_transcript":
                     text = (msg.get("text") or "").strip()
-                    speaker = msg.get("speaker") or current_speaker
+                    speaker = msg.get("speaker") or speaker_state["current"]
                     if text:
                         elapsed = round(time.time() - session_start, 2)
                         logger.info("Manual transcript [%s]: %s", speaker, text[:80])

@@ -81,14 +81,16 @@ export default function TranscriptPanel({ entries }) {
               padding: "0.4rem 0.6rem",
               marginBottom: "0.25rem",
               borderRadius: "var(--radius)",
-              background: "rgba(116,185,255,0.03)",
-              borderLeft: "3px solid rgba(116,185,255,0.3)",
+              background: partialTranscript.speaker === "interviewer"
+                ? "rgba(116,185,255,0.05)"
+                : "rgba(85,239,196,0.05)",
+              borderLeft: `3px solid ${partialTranscript.speaker === "interviewer" ? "var(--interviewer)" : "var(--candidate)"}`,
               opacity: 0.65,
             }}
           >
             <div style={{ display: "flex", alignItems: "center", gap: "0.4rem", marginBottom: "0.15rem" }}>
               <span
-                className="badge"
+                className={`badge ${partialTranscript.speaker === "interviewer" ? "badge-interviewer" : "badge-candidate"}`}
                 style={{ textTransform: "capitalize", fontSize: "0.7rem", opacity: 0.7 }}
               >
                 {partialTranscript.speaker}

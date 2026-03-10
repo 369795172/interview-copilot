@@ -41,6 +41,8 @@ export default function useWebSocket(sessionId) {
             appendSuggestions(msg.payload.suggestions || []);
             break;
           case "speaker_changed":
+            console.log("[WS] speaker_changed:", msg.payload.speaker);
+            setPartialTranscript(null);
             setCurrentSpeaker(msg.payload.speaker);
             break;
           case "transcription_error":

@@ -105,7 +105,8 @@ async def upload_candidate_file(
     profile = await cm.load_candidate_file(str(file_path), file.filename)
     copilot = active_copilots.get(session_id)
     if copilot:
-        copilot.candidate_profile = str(cm.candidate_profile)
+        # Fix: cm.candidate_profile is already raw_text string
+        copilot.candidate_profile = cm.candidate_profile
     return {"status": "ok", "file": file.filename, "profile": profile}
 
 
