@@ -75,9 +75,13 @@ class TranscriptionService:
         self,
         token: Optional[str] = None,
         base_url: Optional[str] = None,
+        prompt: Optional[str] = None,
+        terms: Optional[str] = None,
     ):
         self.token = token or settings.ai_builder_token
         self.base_url = base_url or settings.ai_builder_base_url
+        self.prompt = prompt if prompt is not None else settings.ai_builder_prompt
+        self.terms = terms if terms is not None else settings.ai_builder_terms
 
     @property
     def available(self) -> bool:
@@ -106,6 +110,10 @@ class TranscriptionService:
         ext = "webm" if "webm" in mime_type else "wav"
         files = {"audio_file": (f"chunk.{ext}", io.BytesIO(audio_data), mime_type)}
         data: Dict[str, str] = {"language": language}
+        if self.prompt:
+            data["prompt"] = self.prompt
+        if self.terms:
+            data["terms"] = self.terms
 
         last_error: Optional[str] = None
         for attempt, delay in enumerate(self.RETRY_BACKOFF):

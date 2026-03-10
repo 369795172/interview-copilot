@@ -5,6 +5,7 @@ Supports Volcano Engine streaming ASR (PCM) and AI Builder Space fallback (WebM)
 """
 
 import asyncio
+from collections import deque
 import json
 import logging
 import re
@@ -13,9 +14,11 @@ import time
 from typing import Dict, Any, Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from sqlalchemy import select
 
+from app.config import settings
 from app.database import async_session
-from app.models.db_models import TranscriptEntry, AIInsight
+from app.models.db_models import TranscriptEntry, AIInsight, CopilotLog
 from app.services.transcription import TranscriptionService
 from app.services.copilot import CopilotEngine
 from app.services.memory import MemoryStore
@@ -36,15 +39,24 @@ _SILENCE_ENERGY_THRESHOLD = 0.005
 _AI_BUILDER_SILENCE_THRESHOLD = 0.02
 
 _WHISPER_HALLUCINATION_PATTERNS = [
-    re.compile(r"(风声|噪音|噪声|杂音|干扰).{0,8}(太大|很大|较大|严重)"),
+    re.compile(r"(风声|噪音|噪声|杂音|干扰|背景音|声音).{0,10}(太大|很大|较大|严重|有点大|过大|明显)"),
     re.compile(r"没有听到.{0,6}(清晰|有效|任何)"),
     re.compile(r"(请您?|建议).{0,10}(调整|检查).{0,6}(麦克风|话筒|环境|设备)"),
     re.compile(r"(目前|当前|暂时).{0,8}(没有|无法).{0,8}(听到|识别|检测)"),
     re.compile(r"(听到|检测到).{0,6}(一些|有些).{0,8}(噪音|杂音|干扰|背景)"),
+    re.compile(r"(机器|电脑|设备|风扇).{0,10}(声音|噪音|噪声).{0,6}(大|响)"),
+    re.compile(r"(风扇|机器|设备).{0,8}(出了问题|有问题|故障)"),
     re.compile(r"继续说话"),
     re.compile(r"音频.{0,6}(不清晰|质量|问题)"),
     re.compile(r"^(谢谢|感谢).{0,4}(收看|观看|聆听|收听)"),
+    re.compile(r"(字幕由|本视频由).{0,12}(提供|制作)"),
     re.compile(r"字幕"),
+    re.compile(r"(请(点赞|关注|订阅|三连)|欢迎收看|下期再见)"),
+    re.compile(r"(谢谢大家|感谢大家|感谢您的)"),
+    re.compile(r"^[（(][^）)]{1,8}[）)]$"),
+    re.compile(r"^[嗯啊哦哈嘿]{3,}$"),
+    re.compile(r"^([\u4e00-\u9fffA-Za-z0-9])\1{3,}$"),
+    re.compile(r"[♪♫]"),
 ]
 
 
@@ -98,6 +110,18 @@ async def interview_ws(websocket: WebSocket, session_id: str):
         project_background=gc.get("project_background", ""),
         candidate_profile=str(cm.candidate_profile) if cm else "",
     )
+    if not copilot.transcript_buffer:
+        async with async_session() as db:
+            tr_result = await db.execute(
+                select(TranscriptEntry)
+                .where(TranscriptEntry.session_id == session_id)
+                .order_by(TranscriptEntry.start_time)
+            )
+            previous_entries = tr_result.scalars().all()
+        for entry in previous_entries:
+            copilot.add_transcript(entry.speaker, entry.text)
+        if previous_entries:
+            logger.info("Restored %d transcript entries into copilot cache for session %s", len(previous_entries), session_id)
     logger.info(
         "Copilot context loaded for session %s: cv=%d chars, pb=%d chars, cp=%d chars",
         session_id,
@@ -114,6 +138,7 @@ async def interview_ws(websocket: WebSocket, session_id: str):
     analysis_counter = 0
     ANALYSIS_INTERVAL = 3
     transcription_error_count = 0
+    recent_ai_builder_texts = deque(maxlen=3)
 
     volc_client: Optional[VolcEngineStreamingClient] = None
     volc_connected = False
@@ -132,15 +157,68 @@ async def interview_ws(websocket: WebSocket, session_id: str):
     flush_timer_task: Optional[asyncio.Task] = None
 
     # --- AI Builder buffer flush helper ---
-    async def _flush_ai_builder_buf():
-        nonlocal ai_builder_buf, analysis_counter, transcription_error_count
-        if not ai_builder_buf:
-            return
-        audio_snapshot = bytes(ai_builder_buf)
-        ai_builder_buf.clear()
-        elapsed = round(time.time() - session_start, 2)
-        logger.debug("Flushing AI Builder buffer: %d bytes (t=%.1fs)", len(audio_snapshot), elapsed)
-        result = await transcription_svc.transcribe(audio_snapshot)
+    def _validate_ai_builder_text(result: Dict[str, Any]) -> Optional[str]:
+        text = (result.get("text") or "").strip()
+        if not text:
+            logger.debug("AI Builder transcription empty text")
+            return None
+
+        meaningful_text = re.sub(r"[^A-Za-z0-9\u4e00-\u9fff]+", "", text)
+        min_len = max(1, int(settings.ai_builder_min_text_length))
+        if len(meaningful_text) < min_len:
+            logger.info(
+                "Filtered short AI Builder output (meaningful_len=%d): %s",
+                len(meaningful_text),
+                text,
+            )
+            return None
+
+        threshold = float(settings.ai_builder_confidence_threshold)
+        confidence = result.get("confidence")
+        if confidence is not None:
+            try:
+                conf_val = float(confidence)
+            except (TypeError, ValueError):
+                conf_val = None
+            if conf_val is not None and conf_val < threshold:
+                logger.info("Filtered low-confidence AI Builder output (%.3f): %s", conf_val, text[:80])
+                return None
+
+        segment_confidences = []
+        for seg in (result.get("segments") or []):
+            if not isinstance(seg, dict):
+                continue
+            seg_conf = seg.get("confidence")
+            try:
+                if seg_conf is not None:
+                    segment_confidences.append(float(seg_conf))
+            except (TypeError, ValueError):
+                continue
+        if segment_confidences:
+            avg_conf = sum(segment_confidences) / len(segment_confidences)
+            min_conf = min(segment_confidences)
+            if avg_conf < threshold and min_conf < max(0.05, threshold - 0.15):
+                logger.info(
+                    "Filtered low segment-confidence AI Builder output (avg=%.3f, min=%.3f): %s",
+                    avg_conf,
+                    min_conf,
+                    text[:80],
+                )
+                return None
+
+        if _is_whisper_hallucination(text):
+            logger.info("Filtered Whisper hallucination: %s", text[:80])
+            return None
+
+        normalized = re.sub(r"\s+", " ", text).strip()
+        if normalized in recent_ai_builder_texts:
+            logger.info("Filtered repeated AI Builder output: %s", text[:80])
+            return None
+        recent_ai_builder_texts.append(normalized)
+        return text
+
+    async def _handle_ai_builder_result(result: Dict[str, Any], elapsed: float) -> None:
+        nonlocal analysis_counter, transcription_error_count
         err = result.get("error")
         if err:
             transcription_error_count += 1
@@ -150,13 +228,11 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                 "payload": {"error": err, "count": transcription_error_count},
             })
             return
-        text = result.get("text", "").strip()
+
+        text = _validate_ai_builder_text(result)
         if not text:
-            logger.debug("Transcription returned empty text (silence?)")
             return
-        if _is_whisper_hallucination(text):
-            logger.info("Filtered Whisper hallucination: %s", text[:80])
-            return
+
         spk = speaker_state["current"]
         logger.info("Transcribed [%s]: %s", spk, text[:80])
         entry_id = await _persist_transcript(
@@ -170,6 +246,17 @@ async def interview_ws(websocket: WebSocket, session_id: str):
         if analysis_counter >= ANALYSIS_INTERVAL and copilot.available:
             analysis_counter = 0
             asyncio.create_task(_run_analysis(websocket, copilot, session_id))
+
+    async def _flush_ai_builder_buf():
+        nonlocal ai_builder_buf
+        if not ai_builder_buf:
+            return
+        audio_snapshot = bytes(ai_builder_buf)
+        ai_builder_buf.clear()
+        elapsed = round(time.time() - session_start, 2)
+        logger.debug("Flushing AI Builder buffer: %d bytes (t=%.1fs)", len(audio_snapshot), elapsed)
+        result = await transcription_svc.transcribe(audio_snapshot)
+        await _handle_ai_builder_result(result, elapsed)
 
     async def _silence_flush_timer():
         """Background task: flush the AI Builder buffer after a silence gap."""
@@ -372,34 +459,7 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                     if _is_webm(audio_data):
                         logger.debug("Audio WebM %dB -> AI Builder direct (t=%.1fs)", len(audio_data), elapsed)
                         result = await transcription_svc.transcribe(audio_data)
-                        err = result.get("error")
-                        if err:
-                            transcription_error_count += 1
-                            logger.warning("Transcription error #%d: %s", transcription_error_count, err)
-                            await websocket.send_json({
-                                "type": "transcription_error",
-                                "payload": {"error": err, "count": transcription_error_count},
-                            })
-                            continue
-                        text = result.get("text", "").strip()
-                        if not text:
-                            continue
-                        if _is_whisper_hallucination(text):
-                            logger.info("Filtered Whisper hallucination: %s", text[:80])
-                            continue
-                        spk = speaker_state["current"]
-                        logger.info("Transcribed [%s]: %s", spk, text[:80])
-                        entry_id = await _persist_transcript(
-                            session_id, spk, text, elapsed, copilot, memory,
-                        )
-                        await websocket.send_json({
-                            "type": "transcript",
-                            "payload": {"id": entry_id, "speaker": spk, "text": text, "time": elapsed},
-                        })
-                        analysis_counter += 1
-                        if analysis_counter >= ANALYSIS_INTERVAL and copilot.available:
-                            analysis_counter = 0
-                            asyncio.create_task(_run_analysis(websocket, copilot, session_id))
+                        await _handle_ai_builder_result(result, elapsed)
                     else:
                         # Stricter silence gate for AI Builder to prevent Whisper hallucination
                         if _pcm_is_silence(audio_data, _AI_BUILDER_SILENCE_THRESHOLD):
@@ -482,6 +542,62 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                     if copilot.available:
                         asyncio.create_task(_run_analysis(websocket, copilot, session_id))
 
+                elif msg_type == "custom_suggestion":
+                    content = (msg.get("content") or "").strip()
+                    suggestion_type = (msg.get("suggestion_type") or "follow_up_question").strip()
+                    priority = (msg.get("priority") or "medium").strip()
+                    dimension = (msg.get("dimension") or "").strip()
+                    if content:
+                        suggestion = {
+                            "type": suggestion_type,
+                            "content": content,
+                            "priority": priority,
+                            "dimension": dimension,
+                            "source": "manual",
+                        }
+                        async with async_session() as db:
+                            db.add(
+                                AIInsight(
+                                    session_id=session_id,
+                                    insight_type="custom",
+                                    content=content,
+                                )
+                            )
+                            db.add(
+                                CopilotLog(
+                                    session_id=session_id,
+                                    log_type="custom_question",
+                                    request_summary=content[:500],
+                                    response_content=json.dumps([suggestion], ensure_ascii=False),
+                                    model_used="manual",
+                                )
+                            )
+                            await db.commit()
+                        await websocket.send_json({
+                            "type": "copilot_suggestions",
+                            "payload": {"suggestions": [suggestion]},
+                        })
+
+                elif msg_type == "custom_prompt":
+                    content = (msg.get("content") or "").strip()
+                    if content:
+                        copilot.append_interviewer_memory(content)
+                        async with async_session() as db:
+                            db.add(
+                                CopilotLog(
+                                    session_id=session_id,
+                                    log_type="custom_prompt",
+                                    request_summary=content[:500],
+                                    response_content=copilot.interviewer_memory[:2000],
+                                    model_used="manual",
+                                )
+                            )
+                            await db.commit()
+                        await websocket.send_json({
+                            "type": "custom_prompt_updated",
+                            "payload": {"active": True},
+                        })
+
                 elif msg_type == "ping":
                     await websocket.send_json({"type": "pong"})
 
@@ -538,7 +654,7 @@ async def _send_opening_suggestions(
     """Generate opening suggestions from context and send via WebSocket (background task)."""
     try:
         logger.info("Generating opening suggestions for session %s ...", session_id)
-        opening = await copilot.generate_opening_suggestions()
+        opening = await copilot.generate_opening_suggestions(session_id=session_id)
         if opening:
             async with async_session() as db:
                 for s in opening:
@@ -563,7 +679,7 @@ async def _send_opening_suggestions(
 async def _run_analysis(websocket: WebSocket, copilot: CopilotEngine, session_id: str):
     """Run copilot analysis and send suggestions via WebSocket."""
     try:
-        suggestions = await copilot.analyse()
+        suggestions = await copilot.analyse(session_id=session_id)
         if suggestions:
             async with async_session() as db:
                 for s in suggestions:

@@ -13,7 +13,7 @@ const TYPE_LABELS = {
   anti_repetition_alert: "Repetition",
 };
 
-export default function SuggestionCard({ suggestion, icon: Icon }) {
+export default function SuggestionCard({ suggestion, icon: Icon, pinned, onTogglePin, onDismiss }) {
   const { type, content, dimension, priority } = suggestion;
   const borderColor = PRIORITY_COLORS[priority] || "var(--border)";
 
@@ -39,6 +39,14 @@ export default function SuggestionCard({ suggestion, icon: Icon }) {
         )}
       </div>
       <p style={{ fontSize: "0.85rem", lineHeight: 1.5 }}>{content}</p>
+      <div style={{ display: "flex", gap: "0.4rem", marginTop: "0.45rem" }}>
+        <button className="btn btn-outline btn-sm" onClick={onTogglePin}>
+          {pinned ? "Unpin" : "Pin"}
+        </button>
+        <button className="btn btn-outline btn-sm" onClick={onDismiss}>
+          Dismiss
+        </button>
+      </div>
     </div>
   );
 }

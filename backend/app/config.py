@@ -21,6 +21,12 @@ class Settings(BaseSettings):
     # AI Builder Space – speech-to-text (fallback)
     ai_builder_token: Optional[str] = None
     ai_builder_base_url: str = "https://space.ai-builders.com/backend/v1"
+    ai_builder_confidence_threshold: float = 0.4
+    ai_builder_min_text_length: int = 3
+    ai_builder_prompt: str = (
+        "这是一段面试对话录音。请只转写说话内容，不要描述噪音、设备状态或环境。"
+    )
+    ai_builder_terms: str = ""
 
     # Volcano Engine BigModel ASR (primary, China-optimized)
     stt_provider: str = "auto"  # auto | volcengine | ai_builder

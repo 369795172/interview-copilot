@@ -13,7 +13,7 @@ import { getLatestSession, getSessionChunks, hasReplayData } from "../lib/replay
 export default function LiveInterview() {
   const { sessionId } = useParams();
   const navigate = useNavigate();
-  const { endSession, fetchCoverage } = useInterview();
+  const { endSession, fetchCoverage, fetchTranscript, fetchHistory } = useInterview();
   const { sendAudio, sendMessage } = useWebSocket(sessionId);
   const { isRecording, audioLevel, captureMode, startRecording, stopRecording } = useAudioStream(sendAudio, sessionId);
 
@@ -21,6 +21,38 @@ export default function LiveInterview() {
   const currentSpeaker = useInterviewStore((s) => s.currentSpeaker);
   const suggestions = useInterviewStore((s) => s.suggestions);
   const setCurrentSpeaker = useInterviewStore((s) => s.setCurrentSpeaker);
+  const setSuggestions = useInterviewStore((s) => s.setSuggestions);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function restoreSessionState() {
+      try {
+        await fetchTranscript(sessionId);
+        const history = await fetchHistory(sessionId);
+        if (cancelled || !Array.isArray(history)) return;
+        const restoredSuggestions = history
+          .filter((item) => item?.type === "ai_insight")
+          .map((item) => ({
+            type: item?.payload?.insight_type || "real_time_insight",
+            content: item?.payload?.content || "",
+            priority: "medium",
+            dimension: "",
+          }))
+          .filter((item) => item.content);
+        if (restoredSuggestions.length > 0) {
+          setSuggestions(restoredSuggestions);
+        }
+      } catch (err) {
+        console.warn("[LiveInterview] restore state failed:", err);
+      }
+    }
+    if (sessionId) {
+      restoreSessionState();
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, fetchTranscript, fetchHistory, setSuggestions]);
 
   const [elapsed, setElapsed] = useState(0);
   const [isReplaying, setIsReplaying] = useState(false);
@@ -286,7 +318,7 @@ export default function LiveInterview() {
             overflow: "hidden",
           }}
         >
-          <CopilotPanel suggestions={suggestions} sessionId={sessionId} />
+          <CopilotPanel suggestions={suggestions} sendMessage={sendMessage} />
         </div>
 
         {/* Right: Evaluation */}

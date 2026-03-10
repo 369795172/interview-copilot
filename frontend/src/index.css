@@ -105,6 +105,19 @@ select:focus {
   font-size: 0.8rem;
 }
 
+@keyframes copilot-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.copilot-spin {
+  animation: copilot-spin 0.9s linear infinite;
+}
+
 .card {
   background: var(--bg-card);
   border: 1px solid var(--border);
