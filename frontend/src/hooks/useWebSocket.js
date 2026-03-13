@@ -10,6 +10,7 @@ export default function useWebSocket(sessionId) {
   const setPartialTranscript = useInterviewStore((s) => s.setPartialTranscript);
   const setSttProvider = useInterviewStore((s) => s.setSttProvider);
   const setWs = useInterviewStore((s) => s.setWs);
+  const setCustomGuidanceActive = useInterviewStore((s) => s.setCustomGuidanceActive);
 
   useEffect(() => {
     if (!sessionId) return;
@@ -51,6 +52,9 @@ export default function useWebSocket(sessionId) {
           case "stt_provider":
             setSttProvider(msg.payload);
             break;
+          case "custom_prompt_updated":
+            setCustomGuidanceActive(!!msg?.payload?.active);
+            break;
           case "pong":
             break;
           default:
@@ -77,7 +81,7 @@ export default function useWebSocket(sessionId) {
       clearInterval(hb);
       ws.close();
     };
-  }, [sessionId, addTranscript, appendSuggestions, setCurrentSpeaker, setTranscriptionError, setPartialTranscript, setSttProvider, setWs]);
+  }, [sessionId, addTranscript, appendSuggestions, setCurrentSpeaker, setTranscriptionError, setPartialTranscript, setSttProvider, setWs, setCustomGuidanceActive]);
 
   const sendAudio = useCallback((audioBlob) => {
     const ws = wsRef.current;

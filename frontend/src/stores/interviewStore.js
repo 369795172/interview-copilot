@@ -14,6 +14,9 @@ const useInterviewStore = create((set, get) => ({
 
   // AI Copilot
   suggestions: [],
+  suggestionSeq: 1,
+  pinnedSuggestionIds: [],
+  customGuidanceActive: false,
 
   // Evaluation
   scores: [],
@@ -55,14 +58,55 @@ const useInterviewStore = create((set, get) => ({
 
   addTranscript: (entry) =>
     set((s) => ({ transcript: [...s.transcript, entry] })),
+  setTranscript: (entries) => set({ transcript: entries || [] }),
 
   setCurrentSpeaker: (speaker) => set({ currentSpeaker: speaker }),
 
-  setSuggestions: (suggestions) => set({ suggestions }),
+  setSuggestions: (suggestions) =>
+    set((s) => {
+      const base = s.suggestionSeq;
+      const normalized = (suggestions || []).map((item, idx) => ({
+        ...item,
+        _localId: item?._localId ?? base + idx,
+      }));
+      return {
+        suggestions: normalized,
+        suggestionSeq: base + normalized.length,
+      };
+    }),
   appendSuggestions: (newSugs) =>
     set((s) => ({
-      suggestions: [...newSugs, ...s.suggestions].slice(0, 20),
+      suggestions: (newSugs || [])
+        .map((item, idx) => ({
+          ...item,
+          _localId: item?._localId ?? (s.suggestionSeq + idx),
+        }))
+        .concat(s.suggestions)
+        .slice(0, 20),
+      suggestionSeq: s.suggestionSeq + (newSugs || []).length,
     })),
+  pinSuggestion: (id) =>
+    set((s) => ({
+      pinnedSuggestionIds: s.pinnedSuggestionIds.includes(id)
+        ? s.pinnedSuggestionIds
+        : [id, ...s.pinnedSuggestionIds],
+    })),
+  unpinSuggestion: (id) =>
+    set((s) => ({
+      pinnedSuggestionIds: s.pinnedSuggestionIds.filter((x) => x !== id),
+    })),
+  togglePinSuggestion: (id) =>
+    set((s) => ({
+      pinnedSuggestionIds: s.pinnedSuggestionIds.includes(id)
+        ? s.pinnedSuggestionIds.filter((x) => x !== id)
+        : [id, ...s.pinnedSuggestionIds],
+    })),
+  dismissSuggestion: (id) =>
+    set((s) => ({
+      suggestions: s.suggestions.filter((item) => item._localId !== id),
+      pinnedSuggestionIds: s.pinnedSuggestionIds.filter((x) => x !== id),
+    })),
+  setCustomGuidanceActive: (active) => set({ customGuidanceActive: !!active }),
 
   setScores: (scores) => set({ scores }),
   setCoverage: (coverage) => set({ coverage }),
@@ -87,6 +131,9 @@ const useInterviewStore = create((set, get) => ({
       transcript: [],
       currentSpeaker: "interviewer",
       suggestions: [],
+      suggestionSeq: 1,
+      pinnedSuggestionIds: [],
+      customGuidanceActive: false,
       scores: [],
       coverage: null,
       decision: null,

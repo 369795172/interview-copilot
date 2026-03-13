@@ -59,6 +59,22 @@ class AIInsightOut(BaseModel):
     created_at: datetime
 
 
+class CopilotLogOut(BaseModel):
+    id: str
+    session_id: str
+    log_type: str
+    request_summary: Optional[str] = None
+    response_content: Optional[str] = None
+    model_used: Optional[str] = None
+    created_at: datetime
+
+
+class SessionHistoryItemOut(BaseModel):
+    type: str
+    created_at: datetime
+    payload: Dict[str, Any]
+
+
 # ---------- Evaluation ----------
 
 class EvaluationScoreCreate(BaseModel):

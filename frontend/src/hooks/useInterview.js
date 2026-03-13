@@ -45,6 +45,19 @@ export default function useInterview() {
     return data;
   }, []);
 
+  const fetchTranscript = useCallback(async (sessionId) => {
+    const res = await fetch(`${API}/api/sessions/${sessionId}/transcript`);
+    const data = await res.json();
+    useInterviewStore.getState().setTranscript(data || []);
+    return data;
+  }, []);
+
+  const fetchHistory = useCallback(async (sessionId) => {
+    const res = await fetch(`${API}/api/sessions/${sessionId}/history`);
+    const data = await res.json();
+    return data || [];
+  }, []);
+
   const saveScore = useCallback(async (sessionId, scoreData) => {
     const res = await fetch(`${API}/api/sessions/${sessionId}/evaluation/scores`, {
       method: "POST",
@@ -106,6 +119,8 @@ export default function useInterview() {
     endSession,
     createCandidate,
     fetchCoverage,
+    fetchTranscript,
+    fetchHistory,
     saveScore,
     updateScore,
     exportSession,

@@ -2,19 +2,28 @@
 Interview session CRUD routes.
 """
 
+import json
 from datetime import datetime, timezone
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models.db_models import InterviewSession, Candidate, TranscriptEntry, EvaluationScore
+from app.models.db_models import (
+    InterviewSession,
+    Candidate,
+    TranscriptEntry,
+    EvaluationScore,
+    AIInsight,
+    CopilotLog,
+)
 from app.models.schemas import (
     SessionCreate, SessionOut,
     CandidateCreate, CandidateOut,
     TranscriptEntryOut,
+    SessionHistoryItemOut,
 )
 from app.services.evaluation import EvaluationEngine
 
@@ -98,6 +107,92 @@ async def get_transcript(session_id: str, db: AsyncSession = Depends(get_db)):
         .order_by(TranscriptEntry.start_time)
     )
     return result.scalars().all()
+
+
+@router.get("/{session_id}/history", response_model=List[SessionHistoryItemOut])
+async def get_history(
+    session_id: str,
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db),
+):
+    session = await db.get(InterviewSession, session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+
+    tr_result = await db.execute(
+        select(TranscriptEntry)
+        .where(TranscriptEntry.session_id == session_id)
+        .order_by(TranscriptEntry.created_at)
+    )
+    entries = tr_result.scalars().all()
+
+    insight_result = await db.execute(
+        select(AIInsight)
+        .where(AIInsight.session_id == session_id)
+        .order_by(AIInsight.created_at)
+    )
+    insights = insight_result.scalars().all()
+
+    log_result = await db.execute(
+        select(CopilotLog)
+        .where(CopilotLog.session_id == session_id)
+        .order_by(CopilotLog.created_at)
+    )
+    logs = log_result.scalars().all()
+
+    timeline = []
+    for e in entries:
+        timeline.append(
+            {
+                "type": "transcript",
+                "created_at": e.created_at,
+                "payload": {
+                    "id": e.id,
+                    "speaker": e.speaker,
+                    "text": e.text,
+                    "start_time": e.start_time,
+                },
+            }
+        )
+
+    for s in insights:
+        timeline.append(
+            {
+                "type": "ai_insight",
+                "created_at": s.created_at,
+                "payload": {
+                    "id": s.id,
+                    "insight_type": s.insight_type,
+                    "content": s.content,
+                    "related_transcript_ids": s.related_transcript_ids or [],
+                },
+            }
+        )
+
+    for l in logs:
+        parsed_response = l.response_content
+        if l.response_content:
+            try:
+                parsed_response = json.loads(l.response_content)
+            except Exception:
+                parsed_response = l.response_content
+        timeline.append(
+            {
+                "type": "copilot_log",
+                "created_at": l.created_at,
+                "payload": {
+                    "id": l.id,
+                    "log_type": l.log_type,
+                    "request_summary": l.request_summary,
+                    "response_content": parsed_response,
+                    "model_used": l.model_used,
+                },
+            }
+        )
+
+    timeline.sort(key=lambda item: item["created_at"])
+    return timeline[offset: offset + limit]
 
 
 @router.get("/{session_id}/export")

@@ -45,6 +45,7 @@ class InterviewSession(Base):
     candidate = relationship("Candidate", back_populates="sessions")
     transcript_entries = relationship("TranscriptEntry", back_populates="session", order_by="TranscriptEntry.start_time")
     ai_insights = relationship("AIInsight", back_populates="session", order_by="AIInsight.created_at")
+    copilot_logs = relationship("CopilotLog", back_populates="session", order_by="CopilotLog.created_at")
     evaluation_scores = relationship("EvaluationScore", back_populates="session")
 
 
@@ -74,6 +75,20 @@ class AIInsight(Base):
     created_at = Column(DateTime, default=_utcnow)
 
     session = relationship("InterviewSession", back_populates="ai_insights")
+
+
+class CopilotLog(Base):
+    __tablename__ = "copilot_logs"
+
+    id = Column(String, primary_key=True, default=_new_id)
+    session_id = Column(String, ForeignKey("interview_sessions.id"), nullable=False)
+    log_type = Column(String, nullable=False)
+    request_summary = Column(Text, nullable=True)
+    response_content = Column(Text, nullable=True)
+    model_used = Column(String, nullable=True)
+    created_at = Column(DateTime, default=_utcnow)
+
+    session = relationship("InterviewSession", back_populates="copilot_logs")
 
 
 class EvaluationScore(Base):

@@ -10,6 +10,8 @@ from typing import Optional, List, Dict, Any
 from openai import AsyncOpenAI
 
 from app.config import settings
+from app.database import async_session
+from app.models.db_models import CopilotLog
 from app.prompts.copilot_system import (
     COPILOT_SYSTEM_PROMPT,
     QUESTION_GENERATOR_PROMPT,
@@ -158,7 +160,7 @@ class CopilotEngine:
             logger.warning("LLM returned non-JSON (first 200 chars): %s", raw[:200])
             return fallback
 
-    async def generate_opening_suggestions(self) -> List[Dict[str, Any]]:
+    async def generate_opening_suggestions(self, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """Generate opening questions and strategy from context alone (no transcript needed)."""
         if not self.available:
             logger.warning("Opening suggestions skipped: LLM not available")
@@ -187,6 +189,12 @@ class CopilotEngine:
             if isinstance(parsed, dict):
                 parsed = parsed.get("suggestions", [parsed])
             suggestions = parsed if isinstance(parsed, list) else [parsed]
+            await self._log_llm_interaction(
+                session_id=session_id,
+                log_type="opening_suggestions",
+                request_summary=prompt,
+                response_content=suggestions,
+            )
             logger.info("Generated %d opening suggestions", len(suggestions))
             return suggestions
         except Exception:
@@ -197,6 +205,40 @@ class CopilotEngine:
         self.transcript_buffer.append({"speaker": speaker, "text": text})
         if speaker == "interviewer":
             self.asked_questions.append(text)
+
+    def append_interviewer_memory(self, content: str):
+        content = (content or "").strip()
+        if not content:
+            return
+        if self.interviewer_memory:
+            self.interviewer_memory = f"{self.interviewer_memory}\n{content}"
+        else:
+            self.interviewer_memory = content
+
+    async def _log_llm_interaction(
+        self,
+        session_id: Optional[str],
+        log_type: str,
+        request_summary: str,
+        response_content: Any,
+    ) -> None:
+        if not session_id:
+            return
+        try:
+            payload = response_content if isinstance(response_content, str) else json.dumps(response_content, ensure_ascii=False)
+            async with async_session() as db:
+                db.add(
+                    CopilotLog(
+                        session_id=session_id,
+                        log_type=log_type,
+                        request_summary=request_summary[:1000],
+                        response_content=payload[:8000],
+                        model_used=self.model,
+                    )
+                )
+                await db.commit()
+        except Exception:
+            logger.exception("Failed to persist copilot interaction log")
 
     def _recent_transcript_text(self, last_n: int = 20) -> str:
         entries = self.transcript_buffer[-last_n:]
@@ -211,7 +253,7 @@ class CopilotEngine:
             interviewer_memory=self.interviewer_memory[:1000] or "(none)",
         )
 
-    async def analyse(self) -> List[Dict[str, Any]]:
+    async def analyse(self, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """Run copilot analysis on the current transcript and return suggestions."""
         if not self.available or len(self.transcript_buffer) < 2:
             return []
@@ -239,7 +281,14 @@ class CopilotEngine:
             parsed = self._parse_llm_json(raw, fallback=[])
             if isinstance(parsed, dict):
                 parsed = parsed.get("suggestions", [parsed])
-            return parsed if isinstance(parsed, list) else [parsed]
+            suggestions = parsed if isinstance(parsed, list) else [parsed]
+            await self._log_llm_interaction(
+                session_id=session_id,
+                log_type="analysis",
+                request_summary=user_msg,
+                response_content=suggestions,
+            )
+            return suggestions
         except Exception:
             logger.exception("Copilot analysis failed")
             return []
