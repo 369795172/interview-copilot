@@ -4,6 +4,9 @@ Tracks interviewer patterns, question history, and effective questions.
 """
 
 import logging
+import io
+from contextlib import redirect_stderr
+from pathlib import Path
 from typing import Optional, List, Dict, Any
 
 from app.config import settings
@@ -17,9 +20,22 @@ class MemoryStore:
     def __init__(self):
         self._client = None
         self._collection = None
+        self._disabled = False
 
     def _ensure_client(self):
+        if self._disabled:
+            return
         if self._client is not None:
+            return
+        # Avoid online ONNX model download in live interview path; if model isn't
+        # cached locally, disable memory to keep runtime deterministic.
+        model_cache_dir = Path.home() / ".cache" / "chroma" / "onnx_models" / "all-MiniLM-L6-v2"
+        if not model_cache_dir.exists():
+            logger.warning(
+                "Chroma embedding model cache not found at %s; disabling memory store",
+                model_cache_dir,
+            )
+            self._disabled = True
             return
         try:
             import chromadb
@@ -32,8 +48,10 @@ class MemoryStore:
             logger.info("ChromaDB memory store initialised at %s", persist_dir)
         except ImportError:
             logger.warning("chromadb not installed; memory store disabled")
+            self._disabled = True
         except Exception:
             logger.exception("Failed to initialise ChromaDB")
+            self._disabled = True
 
     @property
     def available(self) -> bool:
@@ -45,22 +63,39 @@ class MemoryStore:
         if not self.available:
             return
         doc_id = f"q-{session_id}-{hash(question) % 10**8}"
-        self._collection.upsert(
-            ids=[doc_id],
-            documents=[question],
-            metadatas=[{"type": "question", "session_id": session_id, "dimension": dimension, "effectiveness": effectiveness}],
-        )
+        try:
+            # Chroma's ONNX downloader may print progress bars to stderr.
+            # Keep server logs clean; memory write is best-effort.
+            with redirect_stderr(io.StringIO()):
+                self._collection.upsert(
+                    ids=[doc_id],
+                    documents=[question],
+                    metadatas=[{"type": "question", "session_id": session_id, "dimension": dimension, "effectiveness": effectiveness}],
+                )
+        except Exception:
+            # Degrade gracefully: memory is best-effort and should not affect live interview.
+            logger.warning("Memory upsert failed; disabling memory for this process", exc_info=True)
+            self._disabled = True
+            self._client = None
+            self._collection = None
 
     def add_insight(self, insight: str, session_id: str, insight_type: str = "pattern"):
         """Record a general insight or pattern."""
         if not self.available:
             return
         doc_id = f"i-{session_id}-{hash(insight) % 10**8}"
-        self._collection.upsert(
-            ids=[doc_id],
-            documents=[insight],
-            metadatas=[{"type": insight_type, "session_id": session_id}],
-        )
+        try:
+            with redirect_stderr(io.StringIO()):
+                self._collection.upsert(
+                    ids=[doc_id],
+                    documents=[insight],
+                    metadatas=[{"type": insight_type, "session_id": session_id}],
+                )
+        except Exception:
+            logger.warning("Memory insight upsert failed; disabling memory for this process", exc_info=True)
+            self._disabled = True
+            self._client = None
+            self._collection = None
 
     def find_similar_questions(self, question: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """Check if a similar question has been asked before."""

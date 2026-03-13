@@ -119,8 +119,8 @@ async def interview_ws(websocket: WebSocket, session_id: str):
     volc_connected = False
     last_volc_audio_time = 0.0
     volc_keepalive_task: Optional[asyncio.Task] = None
-    VOLC_KEEPALIVE_INTERVAL = 8.0  # seconds between keepalive checks
-    VOLC_KEEPALIVE_STALE = 5.0     # send keepalive if no audio for this long
+    VOLC_KEEPALIVE_INTERVAL = 2.0  # seconds between keepalive checks
+    VOLC_KEEPALIVE_STALE = 1.5     # send keepalive if no audio for this long
     VOLC_SILENCE_PACKET = b"\x00" * 640  # 20ms of silence PCM16@16kHz mono
 
     # AI Builder audio buffer — accumulate short PCM chunks before transcribing
@@ -306,6 +306,10 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                     return
 
                 volc_connected = True
+                last_volc_audio_time = time.time()
+                # Warm-up silence prevents provider-side "waiting next packet timeout"
+                # before the user starts speaking.
+                await volc_client.send_audio(VOLC_SILENCE_PACKET)
                 last_volc_audio_time = time.time()
                 volc_keepalive_task = asyncio.create_task(_volc_keepalive_loop())
                 logger.info("VolcEngine ASR connected for session %s", session_id)
@@ -528,7 +532,17 @@ async def _persist_transcript(
         entry_id = entry.id
     copilot.add_transcript(speaker, text)
     if speaker == "interviewer":
-        memory.add_question(text, session_id)
+        try:
+            # Memory write is best-effort and uses blocking Chroma calls;
+            # keep it off the event loop and bound latency.
+            await asyncio.wait_for(
+                asyncio.to_thread(memory.add_question, text, session_id),
+                timeout=2.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Memory write timed out; skipped for session %s", session_id)
+        except Exception:
+            logger.warning("Memory write failed; continuing without memory", exc_info=True)
     return entry_id
 
 
