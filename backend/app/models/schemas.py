@@ -113,7 +113,9 @@ class GitHubImportRequest(BaseModel):
 class ContextSummary(BaseModel):
     company_values: Optional[str] = None
     project_background: Optional[str] = None
-    candidate_profile: Optional[Dict[str, Any]] = None
+    # Backward-compatible: legacy sessions may store dict profile,
+    # newer flow stores resume raw text string.
+    candidate_profile: Optional[Dict[str, Any] | str] = None
     evaluation_framework: Optional[Dict[str, Any]] = None
     custom_notes: Optional[str] = None
 
