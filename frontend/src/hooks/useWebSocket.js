@@ -9,6 +9,7 @@ export default function useWebSocket(sessionId) {
   const setTranscriptionError = useInterviewStore((s) => s.setTranscriptionError);
   const setPartialTranscript = useInterviewStore((s) => s.setPartialTranscript);
   const setSttProvider = useInterviewStore((s) => s.setSttProvider);
+  const setSttHealthy = useInterviewStore((s) => s.setSttHealthy);
   const setWs = useInterviewStore((s) => s.setWs);
   const setCustomGuidanceActive = useInterviewStore((s) => s.setCustomGuidanceActive);
 
@@ -56,6 +57,9 @@ export default function useWebSocket(sessionId) {
             setCustomGuidanceActive(!!msg?.payload?.active);
             break;
           case "pong":
+            if (msg.payload && typeof msg.payload.stt_healthy === "boolean") {
+              setSttHealthy(msg.payload.stt_healthy);
+            }
             break;
           default:
             console.log("[WS] Unknown message type:", msg.type);
@@ -81,7 +85,7 @@ export default function useWebSocket(sessionId) {
       clearInterval(hb);
       ws.close();
     };
-  }, [sessionId, addTranscript, appendSuggestions, setCurrentSpeaker, setTranscriptionError, setPartialTranscript, setSttProvider, setWs, setCustomGuidanceActive]);
+  }, [sessionId, addTranscript, appendSuggestions, setCurrentSpeaker, setTranscriptionError, setPartialTranscript, setSttProvider, setSttHealthy, setWs, setCustomGuidanceActive]);
 
   const sendAudio = useCallback((audioBlob) => {
     const ws = wsRef.current;

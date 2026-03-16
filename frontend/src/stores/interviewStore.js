@@ -42,6 +42,7 @@ const useInterviewStore = create((set, get) => ({
 
   // STT provider info
   sttProvider: null, // { provider, status } or null
+  sttHealthy: null, // from pong payload; true | false | null
 
   // WebSocket
   ws: null,
@@ -119,6 +120,7 @@ const useInterviewStore = create((set, get) => ({
   setTranscriptionError: (err) => set({ transcriptionError: err }),
   setPartialTranscript: (p) => set({ partialTranscript: p }),
   setSttProvider: (info) => set({ sttProvider: info }),
+  setSttHealthy: (v) => set({ sttHealthy: v }),
   setWs: (ws) => set({ ws }),
 
   reset: () =>
@@ -147,6 +149,7 @@ const useInterviewStore = create((set, get) => ({
       transcriptionError: null,
       partialTranscript: null,
       sttProvider: null,
+      sttHealthy: null,
       ws: null,
     }),
 }));

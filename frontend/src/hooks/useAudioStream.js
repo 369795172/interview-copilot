@@ -3,6 +3,8 @@ import { createSession, appendChunk, finishSession } from "../lib/replayStore";
 import useInterviewStore from "../stores/interviewStore";
 
 const CHUNK_INTERVAL_MS = 3000;
+const MAX_CHUNK_BYTES = 1_000_000;
+const SLICE_SIZE = 500_000;
 
 /**
  * Audio capture hook with IndexedDB replay persistence.
@@ -81,13 +83,26 @@ export default function useAudioStream(onChunk, sessionId) {
       const recorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
       mediaRecorderRef.current = recorder;
       recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) {
+        if (e.data.size <= 0) return;
+        const deltaMs = Date.now() - startTimeRef.current;
+        if (e.data.size <= MAX_CHUNK_BYTES) {
           onChunk(e.data);
           seqRef.current++;
-          const deltaMs = Date.now() - startTimeRef.current;
+          const seq = seqRef.current;
           e.data.arrayBuffer().then((buf) => {
-            appendChunk(sessionId, seqRef.current, deltaMs, buf).catch(() => {});
+            appendChunk(sessionId, seq, deltaMs, buf).catch(() => {});
           });
+        } else {
+          for (let offset = 0; offset < e.data.size; offset += SLICE_SIZE) {
+            const end = Math.min(offset + SLICE_SIZE, e.data.size);
+            const slice = e.data.slice(offset, end);
+            onChunk(slice);
+            seqRef.current++;
+            const seq = seqRef.current;
+            slice.arrayBuffer().then((buf) => {
+              appendChunk(sessionId, seq, deltaMs, buf).catch(() => {});
+            });
+          }
         }
       };
       recorder.start(CHUNK_INTERVAL_MS);

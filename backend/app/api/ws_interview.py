@@ -24,6 +24,7 @@ from app.services.copilot import CopilotEngine
 from app.services.memory import MemoryStore
 from app.services.stt_router import use_volcengine, create_volcengine_client, _is_webm
 from app.services.stt_volcengine import VolcEngineStreamingClient
+from websockets.protocol import State as WsState
 from app.services.global_context import global_context_store
 
 logger = logging.getLogger(__name__)
@@ -142,8 +143,10 @@ async def interview_ws(websocket: WebSocket, session_id: str):
 
     volc_client: Optional[VolcEngineStreamingClient] = None
     volc_connected = False
+    volc_session_start_time = 0.0
     last_volc_audio_time = 0.0
     volc_keepalive_task: Optional[asyncio.Task] = None
+    ROTATE_THRESHOLD_SEC = settings.volc_session_rotate_sec
     VOLC_KEEPALIVE_INTERVAL = 8.0  # seconds between keepalive checks
     VOLC_KEEPALIVE_STALE = 5.0     # send keepalive if no audio for this long
     VOLC_SILENCE_PACKET = b"\x00" * 640  # 20ms of silence PCM16@16kHz mono
@@ -263,13 +266,79 @@ async def interview_ws(websocket: WebSocket, session_id: str):
         await asyncio.sleep(FLUSH_SILENCE_SECS)
         await _flush_ai_builder_buf()
 
+    async def _commit_volc_partial_and_flush(speaker: str) -> None:
+        """Save uncommitted VolcEngine partial and flush AI Builder buffer before switch/restart."""
+        nonlocal flush_timer_task, volc_partial, volc_consumed
+        if flush_timer_task and not flush_timer_task.done():
+            flush_timer_task.cancel()
+            flush_timer_task = None
+        if ai_builder_buf:
+            await _flush_ai_builder_buf()
+        if volc_partial["text"]:
+            elapsed = round(time.time() - session_start, 2)
+            logger.info("Committing VolcEngine partial [%s]: %s", speaker, volc_partial["text"][:80])
+            entry_id = await _persist_transcript(
+                session_id, speaker, volc_partial["text"], elapsed, copilot, memory,
+            )
+            await websocket.send_json({
+                "type": "transcript",
+                "payload": {"id": entry_id, "speaker": speaker, "text": volc_partial["text"], "time": elapsed},
+            })
+            volc_consumed["offset"] = volc_partial["full_len"]
+            volc_partial["text"] = ""
+            volc_partial["full_len"] = 0
+            skip_volc_definitive["flag"] = True
+
     async def _volc_keepalive_loop():
-        """Send periodic silence packets to VolcEngine to prevent server-side session timeout."""
-        nonlocal volc_connected
+        """Send periodic silence packets to VolcEngine to prevent server-side session timeout.
+        Also rotates VolcEngine session before ~10min limit when ROTATE_THRESHOLD_SEC > 0.
+        """
+        nonlocal volc_connected, volc_client, volc_session_start_time, volc_consumed, volc_partial
         while volc_connected and volc_client:
             await asyncio.sleep(VOLC_KEEPALIVE_INTERVAL)
             if not volc_connected or not volc_client:
                 break
+            elapsed = time.time() - volc_session_start_time
+            # Session rotation: rebuild connection before ~10min limit
+            if ROTATE_THRESHOLD_SEC > 0 and elapsed >= ROTATE_THRESHOLD_SEC:
+                try:
+                    logger.info("VolcEngine session rotation at %.1fs for session %s", elapsed, session_id)
+                    await _commit_volc_partial_and_flush(speaker_state["current"])
+                    old_client = volc_client
+                    volc_client = None
+                    await old_client.close()
+                    new_client = create_volcengine_client(
+                        on_result=_on_volc_result_sync,
+                        on_error=_on_volc_error,
+                    )
+                    if new_client:
+                        await new_client.connect()
+                        volc_client = new_client
+                        volc_session_start_time = time.time()
+                        volc_consumed["offset"] = 0
+                        volc_partial["text"] = ""
+                        volc_partial["full_len"] = 0
+                        logger.info("VolcEngine session rotated for session %s", session_id)
+                    else:
+                        volc_connected = False
+                        await websocket.send_json({
+                            "type": "stt_provider",
+                            "payload": {"provider": "ai_builder", "status": "fallback"},
+                        })
+                        break
+                except Exception:
+                    logger.exception("VolcEngine session rotation failed, falling back to AI Builder")
+                    volc_connected = False
+                    volc_client = None
+                    try:
+                        await websocket.send_json({
+                            "type": "stt_provider",
+                            "payload": {"provider": "ai_builder", "status": "fallback"},
+                        })
+                    except Exception:
+                        pass
+                    break
+                continue
             idle = time.time() - last_volc_audio_time
             if idle >= VOLC_KEEPALIVE_STALE:
                 try:
@@ -278,13 +347,7 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                 except Exception:
                     logger.warning("VolcEngine keepalive failed, marking disconnected")
                     volc_connected = False
-                    try:
-                        await websocket.send_json({
-                            "type": "stt_provider",
-                            "payload": {"provider": "ai_builder", "status": "fallback"},
-                        })
-                    except Exception:
-                        pass
+                    asyncio.create_task(_do_volc_recovery())
                     break
 
     # Callback closures for Volcano Engine streaming results.
@@ -359,16 +422,57 @@ async def interview_ws(websocket: WebSocket, session_id: str):
         asyncio.create_task(_on_volc_text(text, definite))
 
     def _on_volc_error(err: str):
-        nonlocal volc_connected
         logger.error("VolcEngine ASR error: %s", err)
-        volc_connected = False
+        asyncio.create_task(_do_volc_recovery())
+
+    async def _do_volc_recovery():
+        """Save partial, try restart VolcEngine, fallback to AI Builder on failure."""
+        nonlocal volc_client, volc_connected, volc_session_start_time, volc_consumed, volc_partial
         try:
-            asyncio.create_task(websocket.send_json({
+            await _commit_volc_partial_and_flush(speaker_state["current"])
+            old_client = volc_client
+            volc_client = None
+            volc_connected = False
+            if old_client:
+                try:
+                    await old_client.close()
+                except Exception:
+                    pass
+            new_client = create_volcengine_client(
+                on_result=_on_volc_result_sync,
+                on_error=_on_volc_error,
+            )
+            if new_client:
+                try:
+                    await new_client.connect()
+                    volc_client = new_client
+                    volc_connected = True
+                    volc_session_start_time = time.time()
+                    volc_consumed["offset"] = 0
+                    volc_partial["text"] = ""
+                    volc_partial["full_len"] = 0
+                    logger.info("VolcEngine reconnected for session %s", session_id)
+                    await websocket.send_json({
+                        "type": "stt_provider",
+                        "payload": {"provider": "volcengine", "status": "reconnected"},
+                    })
+                    return
+                except Exception:
+                    logger.exception("VolcEngine reconnect failed")
+            logger.info("VolcEngine recovery failed, falling back to AI Builder for session %s", session_id)
+            await websocket.send_json({
                 "type": "stt_provider",
                 "payload": {"provider": "ai_builder", "status": "fallback"},
-            }))
+            })
         except Exception:
-            pass
+            logger.exception("VolcEngine recovery error")
+            try:
+                await websocket.send_json({
+                    "type": "stt_provider",
+                    "payload": {"provider": "ai_builder", "status": "fallback"},
+                })
+            except Exception:
+                pass
 
     # Try to set up Volcano Engine streaming client
     volc_client = create_volcengine_client(
@@ -393,6 +497,7 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                     return
 
                 volc_connected = True
+                volc_session_start_time = time.time()
                 last_volc_audio_time = time.time()
                 volc_keepalive_task = asyncio.create_task(_volc_keepalive_loop())
                 logger.info("VolcEngine ASR connected for session %s", session_id)
@@ -444,15 +549,9 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                         await volc_client.send_audio(audio_data)
                         last_volc_audio_time = time.time()
                     except Exception:
-                        logger.exception("VolcEngine send_audio failed, falling back to AI Builder")
+                        logger.exception("VolcEngine send_audio failed, triggering recovery")
                         volc_connected = False
-                        try:
-                            await websocket.send_json({
-                                "type": "stt_provider",
-                                "payload": {"provider": "ai_builder", "status": "fallback"},
-                            })
-                        except Exception:
-                            pass
+                        asyncio.create_task(_do_volc_recovery())
                 else:
                     # WebM blobs (MediaRecorder) are already substantial; send directly.
                     # PCM 200ms chunks must be accumulated to avoid Whisper hallucination.
@@ -490,28 +589,7 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                         "candidate" if old_spk == "interviewer" else "interviewer",
                     )
 
-                    if flush_timer_task and not flush_timer_task.done():
-                        flush_timer_task.cancel()
-
-                    if ai_builder_buf:
-                        await _flush_ai_builder_buf()
-
-                    if volc_partial["text"]:
-                        elapsed = round(time.time() - session_start, 2)
-                        logger.info("Committing VolcEngine partial on speaker switch [%s]: %s",
-                                    old_spk, volc_partial["text"][:80])
-                        entry_id = await _persist_transcript(
-                            session_id, old_spk, volc_partial["text"], elapsed, copilot, memory,
-                        )
-                        await websocket.send_json({
-                            "type": "transcript",
-                            "payload": {"id": entry_id, "speaker": old_spk,
-                                        "text": volc_partial["text"], "time": elapsed},
-                        })
-                        volc_consumed["offset"] = volc_partial["full_len"]
-                        volc_partial["text"] = ""
-                        volc_partial["full_len"] = 0
-                        skip_volc_definitive["flag"] = True
+                    await _commit_volc_partial_and_flush(old_spk)
 
                     speaker_state["current"] = new_spk
                     logger.info("Speaker toggle: %s -> %s", old_spk, new_spk)
@@ -599,7 +677,19 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                         })
 
                 elif msg_type == "ping":
-                    await websocket.send_json({"type": "pong"})
+                    def _volc_ws_open(client) -> bool:
+                        return bool(client and getattr(client, "_ws", None) and getattr(client._ws, "state", None) == WsState.OPEN)
+                    if volc_connected:
+                        stt_healthy = _volc_ws_open(volc_client)
+                    else:
+                        stt_healthy = True  # AI Builder: HTTP, no long-lived connection
+                    await websocket.send_json({
+                        "type": "pong",
+                        "payload": {
+                            "stt_provider": "volcengine" if volc_connected else "ai_builder",
+                            "stt_healthy": stt_healthy,
+                        },
+                    })
 
     except (WebSocketDisconnect, RuntimeError):
         logger.info("WebSocket disconnected for session %s", session_id)

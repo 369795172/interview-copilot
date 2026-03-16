@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     stt_provider: str = "auto"  # auto | volcengine | ai_builder
     volcengine_app_id: Optional[str] = None
     volcengine_asr_token: Optional[str] = None
+    volc_session_rotate_sec: int = 480  # rotate VolcEngine session before ~10min limit; 0=disabled
 
     # LLM via OpenRouter (OpenAI-compatible)
     llm_api_key: Optional[str] = None
