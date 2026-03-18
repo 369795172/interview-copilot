@@ -10,7 +10,7 @@ const useInterviewStore = create((set, get) => ({
 
   // Transcript
   transcript: [],
-  currentSpeaker: "interviewer",
+  currentSpeaker: "candidate",
 
   // AI Copilot
   suggestions: [],
@@ -135,7 +135,7 @@ const useInterviewStore = create((set, get) => ({
       candidateId: null,
       candidateName: "",
       transcript: [],
-      currentSpeaker: "interviewer",
+      currentSpeaker: "candidate",
       suggestions: [],
       suggestionSeq: 1,
       pinnedSuggestionIds: [],

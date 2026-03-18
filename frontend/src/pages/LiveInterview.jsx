@@ -1,10 +1,11 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import { Square, Mic, MicOff, User, UserCheck, RefreshCw, RotateCcw, Send } from "lucide-react";
+import { Square, Mic, MicOff, User, UserCheck, RefreshCw, RotateCcw, Send, Settings } from "lucide-react";
 import useWebSocket from "../hooks/useWebSocket";
 import useAudioStream from "../hooks/useAudioStream";
 import useInterview from "../hooks/useInterview";
 import useInterviewStore from "../stores/interviewStore";
+import useSettingsStore from "../stores/settingsStore";
 import TranscriptPanel from "../components/transcript/TranscriptPanel";
 import CopilotPanel from "../components/copilot/CopilotPanel";
 import ScoreCard from "../components/evaluation/ScoreCard";
@@ -61,6 +62,29 @@ export default function LiveInterview() {
   const [manualText, setManualText] = useState("");
   const [manualSpeaker, setManualSpeaker] = useState("interviewer");
   const timerRef = useRef(null);
+  const revertTimeoutRef = useRef(null);
+  const interviewerShortcutKey = useSettingsStore((s) => s.interviewerShortcutKey);
+
+  const REVERT_DELAY_MS = 350;
+
+  const switchToInterviewer = useCallback(() => {
+    if (revertTimeoutRef.current) {
+      clearTimeout(revertTimeoutRef.current);
+      revertTimeoutRef.current = null;
+    }
+    setCurrentSpeaker("interviewer");
+    sendMessage({ type: "speaker_toggle", speaker: "interviewer" });
+  }, [setCurrentSpeaker, sendMessage]);
+
+  const switchToCandidate = useCallback(() => {
+    const doRevert = () => {
+      setCurrentSpeaker("candidate");
+      sendMessage({ type: "speaker_toggle", speaker: "candidate" });
+      revertTimeoutRef.current = null;
+    };
+    if (revertTimeoutRef.current) clearTimeout(revertTimeoutRef.current);
+    revertTimeoutRef.current = setTimeout(doRevert, REVERT_DELAY_MS);
+  }, [setCurrentSpeaker, sendMessage]);
 
   useEffect(() => {
     timerRef.current = setInterval(() => setElapsed((e) => e + 1), 1000);
@@ -77,12 +101,62 @@ export default function LiveInterview() {
     hasReplayData().then(setReplayAvailable).catch(() => {});
   }, [isRecording]);
 
-  const toggleSpeaker = () => {
-    const next = currentSpeaker === "interviewer" ? "candidate" : "interviewer";
-    console.log("[Speaker] toggle %s -> %s", currentSpeaker, next);
-    setCurrentSpeaker(next);
-    sendMessage({ type: "speaker_toggle", speaker: next });
-  };
+  useEffect(() => {
+    const key = (interviewerShortcutKey ?? "i").toString().toLowerCase();
+    const isModifier = ["alt", "control", "meta", "shift"].includes(key);
+
+    const matchesKey = (e) => {
+      const k = (e.key ?? "").toLowerCase();
+      const code = (e.code ?? "").toLowerCase();
+      return k === key || code === key;
+    };
+
+    const isInputFocused = () => {
+      const el = document.activeElement;
+      if (!el) return false;
+      const tag = el.tagName?.toUpperCase?.();
+      if (tag === "INPUT" || tag === "TEXTAREA") return true;
+      if (el.getAttribute?.("contenteditable") === "true") return true;
+      return false;
+    };
+
+    const onKeyDown = (e) => {
+      if (isInputFocused()) return;
+      if (e.isComposing) return; // IME active, avoid interference
+      if (matchesKey(e)) {
+        e.preventDefault();
+        if (e.repeat) {
+          // Key repeat: user still holding, clear any pending revert so we stay in interviewer
+          if (revertTimeoutRef.current) {
+            clearTimeout(revertTimeoutRef.current);
+            revertTimeoutRef.current = null;
+          }
+          return;
+        }
+        switchToInterviewer();
+      }
+    };
+
+    const onKeyUp = (e) => {
+      if (isInputFocused()) return;
+      if (e.isComposing) return; // IME active
+      if (matchesKey(e)) {
+        e.preventDefault();
+        switchToCandidate();
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown, { capture: true });
+    window.addEventListener("keyup", onKeyUp, { capture: true });
+    return () => {
+      window.removeEventListener("keydown", onKeyDown, { capture: true });
+      window.removeEventListener("keyup", onKeyUp, { capture: true });
+    };
+  }, [interviewerShortcutKey, switchToInterviewer, switchToCandidate]);
+
+  useEffect(() => () => {
+    if (revertTimeoutRef.current) clearTimeout(revertTimeoutRef.current);
+  }, []);
 
   const handleEnd = async () => {
     stopRecording();
@@ -156,6 +230,14 @@ export default function LiveInterview() {
       >
         <div style={{ display: "flex", alignItems: "center", gap: "1rem" }}>
           <span style={{ fontWeight: 700 }}>Interview Copilot</span>
+          <button
+            className="btn btn-outline btn-sm"
+            onClick={() => navigate("/settings")}
+            title="Settings"
+            style={{ padding: "0.2rem 0.4rem" }}
+          >
+            <Settings size={14} />
+          </button>
           <span style={{ color: "var(--text-dim)", fontFamily: "monospace" }}>{fmtTime(elapsed)}</span>
           {captureMode !== "none" && (
             <span
@@ -173,17 +255,37 @@ export default function LiveInterview() {
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
-          {/* Speaker toggle */}
-          <button
-            className="btn btn-outline btn-sm"
-            onClick={toggleSpeaker}
-            title="Toggle speaker"
+          {/* Speaker indicator + Hold-to-speak */}
+          <span
+            style={{
+              fontSize: "0.8rem",
+              color: currentSpeaker === "interviewer" ? "var(--interviewer)" : "var(--candidate)",
+              display: "flex",
+              alignItems: "center",
+              gap: "0.35rem",
+            }}
           >
             {currentSpeaker === "interviewer" ? (
-              <><UserCheck size={14} style={{ color: "var(--interviewer)" }} /> Interviewer</>
+              <><UserCheck size={14} /> Interviewer</>
             ) : (
-              <><User size={14} style={{ color: "var(--candidate)" }} /> Candidate</>
+              <><User size={14} /> Candidate</>
             )}
+          </span>
+          <button
+            className={`btn btn-sm ${currentSpeaker === "interviewer" ? "btn-primary" : "btn-outline"}`}
+            style={
+              currentSpeaker === "interviewer"
+                ? { borderColor: "var(--interviewer)", background: "rgba(116,185,255,0.2)", color: "var(--interviewer)" }
+                : {}
+            }
+            onMouseDown={switchToInterviewer}
+            onMouseUp={switchToCandidate}
+            onMouseLeave={switchToCandidate}
+            onTouchStart={(e) => { e.preventDefault(); switchToInterviewer(); }}
+            onTouchEnd={(e) => { e.preventDefault(); switchToCandidate(); }}
+            title="Hold to speak as Interviewer (or use shortcut)"
+          >
+            <UserCheck size={14} /> Hold = Interviewer
           </button>
 
           {/* Record button */}

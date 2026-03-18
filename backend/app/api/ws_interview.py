@@ -133,7 +133,7 @@ async def interview_ws(websocket: WebSocket, session_id: str):
     )
 
     session_start = time.time()
-    speaker_state = {"current": "interviewer"}
+    speaker_state = {"current": "candidate"}
     volc_partial = {"text": "", "full_len": 0}
     volc_consumed = {"offset": 0}
     skip_volc_definitive = {"flag": False}

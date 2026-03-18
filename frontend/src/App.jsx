@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
-import { Plus, Users, ChevronRight } from "lucide-react";
+import { Plus, Users, ChevronRight, Settings } from "lucide-react";
 import useInterview from "./hooks/useInterview";
 
 export default function App() {
@@ -47,9 +47,18 @@ export default function App() {
           <h1 style={{ fontSize: "1.5rem", fontWeight: 700 }}>Interview Copilot</h1>
           <p style={{ color: "var(--text-dim)", marginTop: 4 }}>AI-powered interview assistant</p>
         </div>
-        <button className="btn btn-primary" onClick={() => setShowCreate(true)}>
-          <Plus size={16} /> New Session
-        </button>
+        <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+          <button
+            className="btn btn-outline btn-sm"
+            onClick={() => navigate("/settings")}
+            title="Settings"
+          >
+            <Settings size={16} />
+          </button>
+          <button className="btn btn-primary" onClick={() => setShowCreate(true)}>
+            <Plus size={16} /> New Session
+          </button>
+        </div>
       </header>
 
       {showCreate && (

@@ -77,23 +77,45 @@ export default function TranscriptPanel({ entries }) {
         ))}
         {partialTranscript && (
           <div
-            style={{
-              padding: "0.4rem 0.6rem",
-              marginBottom: "0.25rem",
-              borderRadius: "var(--radius)",
-              background: partialTranscript.speaker === "interviewer"
-                ? "rgba(116,185,255,0.05)"
-                : "rgba(85,239,196,0.05)",
-              borderLeft: `3px solid ${partialTranscript.speaker === "interviewer" ? "var(--interviewer)" : "var(--candidate)"}`,
-              opacity: 0.65,
-            }}
+            style={
+              partialTranscript.speaker === "interviewer"
+                ? {
+                    padding: "0.25rem 0.5rem",
+                    marginBottom: "0.2rem",
+                    borderRadius: "var(--radius)",
+                    background: "rgba(116,185,255,0.03)",
+                    borderLeft: "2px solid rgba(116,185,255,0.4)",
+                    opacity: 0.65,
+                  }
+                : {
+                    padding: "0.4rem 0.6rem",
+                    marginBottom: "0.25rem",
+                    borderRadius: "var(--radius)",
+                    background: "rgba(85,239,196,0.05)",
+                    borderLeft: "3px solid var(--candidate)",
+                    opacity: 0.65,
+                  }
+            }
           >
-            <div style={{ display: "flex", alignItems: "center", gap: "0.4rem", marginBottom: "0.15rem" }}>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: partialTranscript.speaker === "interviewer" ? "0.5rem" : "0.4rem",
+                flexWrap: partialTranscript.speaker === "interviewer" ? "wrap" : "nowrap",
+                marginBottom: partialTranscript.speaker === "interviewer" ? 0 : "0.15rem",
+              }}
+            >
               <span
                 className={`badge ${partialTranscript.speaker === "interviewer" ? "badge-interviewer" : "badge-candidate"}`}
-                style={{ textTransform: "capitalize", fontSize: "0.7rem", opacity: 0.7 }}
+                style={{
+                  textTransform: "capitalize",
+                  fontSize: partialTranscript.speaker === "interviewer" ? "0.65rem" : "0.7rem",
+                  padding: partialTranscript.speaker === "interviewer" ? "0.1rem 0.35rem" : undefined,
+                  opacity: 0.7,
+                }}
               >
-                {partialTranscript.speaker}
+                {partialTranscript.speaker === "interviewer" ? "Q" : partialTranscript.speaker}
               </span>
               <span
                 style={{
@@ -105,10 +127,17 @@ export default function TranscriptPanel({ entries }) {
                   animation: "pulse 1.2s infinite",
                 }}
               />
+              {partialTranscript.speaker === "interviewer" && (
+                <span style={{ fontSize: "0.78rem", lineHeight: 1.4, fontStyle: "italic" }}>
+                  {partialTranscript.text}
+                </span>
+              )}
             </div>
-            <p style={{ fontSize: "0.85rem", lineHeight: 1.5, fontStyle: "italic" }}>
-              {partialTranscript.text}
-            </p>
+            {partialTranscript.speaker !== "interviewer" && (
+              <p style={{ fontSize: "0.85rem", lineHeight: 1.5, fontStyle: "italic" }}>
+                {partialTranscript.text}
+              </p>
+            )}
           </div>
         )}
         <div ref={bottomRef} />
