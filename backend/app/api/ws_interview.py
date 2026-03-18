@@ -14,7 +14,7 @@ import time
 from typing import Dict, Any, Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.config import settings
 from app.database import async_session
@@ -24,6 +24,7 @@ from app.services.copilot import CopilotEngine
 from app.services.memory import MemoryStore
 from app.services.stt_router import use_volcengine, create_volcengine_client, _is_webm
 from app.services.stt_volcengine import VolcEngineStreamingClient
+from app.services.transcript_refiner import TranscriptRefiner
 from websockets.protocol import State as WsState
 from app.services.global_context import global_context_store
 
@@ -136,6 +137,10 @@ async def interview_ws(websocket: WebSocket, session_id: str):
     volc_partial = {"text": "", "full_len": 0}
     volc_consumed = {"offset": 0}
     skip_volc_definitive = {"flag": False}
+    last_definitive_entry_id = None
+    last_definitive_time = 0.0
+    MERGE_THRESHOLD_CHARS = 10
+    MERGE_WINDOW_SEC = 2.0
     analysis_counter = 0
     ANALYSIS_INTERVAL = 3
     transcription_error_count = 0
@@ -245,6 +250,8 @@ async def interview_ws(websocket: WebSocket, session_id: str):
             "type": "transcript",
             "payload": {"id": entry_id, "speaker": spk, "text": text, "time": elapsed},
         })
+        if settings.llm_refine_enabled:
+            asyncio.create_task(_run_refinement(websocket, entry_id, session_id, text, spk, elapsed))
         analysis_counter += 1
         if analysis_counter >= ANALYSIS_INTERVAL and copilot.available:
             analysis_counter = 0
@@ -268,7 +275,7 @@ async def interview_ws(websocket: WebSocket, session_id: str):
 
     async def _commit_volc_partial_and_flush(speaker: str) -> None:
         """Save uncommitted VolcEngine partial and flush AI Builder buffer before switch/restart."""
-        nonlocal flush_timer_task, volc_partial, volc_consumed
+        nonlocal flush_timer_task, volc_partial, volc_consumed, last_definitive_entry_id, last_definitive_time
         if flush_timer_task and not flush_timer_task.done():
             flush_timer_task.cancel()
             flush_timer_task = None
@@ -276,18 +283,23 @@ async def interview_ws(websocket: WebSocket, session_id: str):
             await _flush_ai_builder_buf()
         if volc_partial["text"]:
             elapsed = round(time.time() - session_start, 2)
-            logger.info("Committing VolcEngine partial [%s]: %s", speaker, volc_partial["text"][:80])
+            text = volc_partial["text"]
+            logger.info("Committing VolcEngine partial [%s]: %s", speaker, text[:80])
             entry_id = await _persist_transcript(
-                session_id, speaker, volc_partial["text"], elapsed, copilot, memory,
+                session_id, speaker, text, elapsed, copilot, memory,
             )
             await websocket.send_json({
                 "type": "transcript",
-                "payload": {"id": entry_id, "speaker": speaker, "text": volc_partial["text"], "time": elapsed},
+                "payload": {"id": entry_id, "speaker": speaker, "text": text, "time": elapsed},
             })
+            if settings.llm_refine_enabled:
+                asyncio.create_task(_run_refinement(websocket, entry_id, session_id, text, speaker, elapsed))
             volc_consumed["offset"] = volc_partial["full_len"]
             volc_partial["text"] = ""
             volc_partial["full_len"] = 0
             skip_volc_definitive["flag"] = True
+            last_definitive_entry_id = None
+            last_definitive_time = 0.0
 
     async def _volc_keepalive_loop():
         """Send periodic silence packets to VolcEngine to prevent server-side session timeout.
@@ -357,7 +369,7 @@ async def interview_ws(websocket: WebSocket, session_id: str):
     _PUNCT_STRIP = " \t\n。，、？！.?!,;；：:"
 
     async def _on_volc_text(text: str, definite: bool):
-        nonlocal analysis_counter
+        nonlocal analysis_counter, last_definitive_entry_id, last_definitive_time
         spk = speaker_state["current"]
         elapsed = round(time.time() - session_start, 2)
 
@@ -384,6 +396,35 @@ async def interview_ws(websocket: WebSocket, session_id: str):
             if not new_text:
                 return
 
+            # Fragment merge: short segment within 2s of previous -> append to last entry
+            if (
+                len(new_text) < MERGE_THRESHOLD_CHARS
+                and last_definitive_entry_id
+                and (elapsed - last_definitive_time) < MERGE_WINDOW_SEC
+            ):
+                try:
+                    async with async_session() as db:
+                        result = await db.execute(
+                            select(TranscriptEntry).where(TranscriptEntry.id == last_definitive_entry_id)
+                        )
+                        entry = result.scalar_one_or_none()
+                    if entry and entry.speaker == spk:
+                        merged_text = f"{entry.text}{new_text}"
+                        async with async_session() as db:
+                            await db.execute(
+                                update(TranscriptEntry).where(TranscriptEntry.id == last_definitive_entry_id).values(text=merged_text)
+                            )
+                            await db.commit()
+                        copilot.update_last_transcript(spk, merged_text)
+                        await websocket.send_json({
+                            "type": "transcript_refined",
+                            "payload": {"id": last_definitive_entry_id, "speaker": spk, "text": merged_text, "time": last_definitive_time},
+                        })
+                        logger.debug("Merged fragment [%s]: %s", spk, merged_text[:60])
+                        return
+                except Exception as e:
+                    logger.warning("Fragment merge failed: %s", e)
+
             logger.info("VolcEngine transcribed [%s]: %s", spk, new_text[:80])
             entry_id = None
             async with async_session() as db:
@@ -404,6 +445,10 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                 "type": "transcript",
                 "payload": {"id": entry_id, "speaker": spk, "text": new_text, "time": elapsed},
             })
+            if settings.llm_refine_enabled:
+                asyncio.create_task(_run_refinement(websocket, entry_id, session_id, new_text, spk, elapsed))
+            last_definitive_entry_id = entry_id
+            last_definitive_time = elapsed
             analysis_counter += 1
             if analysis_counter >= ANALYSIS_INTERVAL and copilot.available:
                 analysis_counter = 0
@@ -736,6 +781,38 @@ async def _persist_transcript(
     if speaker == "interviewer":
         memory.add_question(text, session_id)
     return entry_id
+
+
+async def _run_refinement(
+    websocket: WebSocket,
+    entry_id: Optional[str],
+    session_id: str,
+    raw_text: str,
+    speaker: str,
+    elapsed: float,
+) -> None:
+    """Background: refine transcript via LLM, update DB, send transcript_refined."""
+    if not entry_id or not raw_text.strip():
+        return
+    refiner = TranscriptRefiner()
+    if not refiner.available:
+        return
+    try:
+        refined = await refiner.refine(raw_text)
+        if not refined or refined == raw_text:
+            return
+        async with async_session() as db:
+            await db.execute(
+                update(TranscriptEntry).where(TranscriptEntry.id == entry_id).values(text=refined)
+            )
+            await db.commit()
+        await websocket.send_json({
+            "type": "transcript_refined",
+            "payload": {"id": entry_id, "speaker": speaker, "text": refined, "time": elapsed},
+        })
+        logger.debug("Refined transcript [%s]: %s", speaker, refined[:60])
+    except Exception as e:
+        logger.warning("Transcript refinement failed for entry %s: %s", entry_id, e)
 
 
 async def _send_opening_suggestions(

@@ -60,6 +60,10 @@ const useInterviewStore = create((set, get) => ({
   addTranscript: (entry) =>
     set((s) => ({ transcript: [...s.transcript, entry] })),
   setTranscript: (entries) => set({ transcript: entries || [] }),
+  updateTranscriptRefined: (id, text) =>
+    set((s) => ({
+      transcript: s.transcript.map((e) => (e.id === id ? { ...e, text } : e)),
+    })),
 
   setCurrentSpeaker: (speaker) => set({ currentSpeaker: speaker }),
 

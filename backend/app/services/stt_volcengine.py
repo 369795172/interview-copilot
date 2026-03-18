@@ -48,6 +48,18 @@ def _build_full_client_request() -> bytes:
     Wire format: header(4) | sequence(4) | payload_size(4) | compressed_json
     Sequence=1 for the initial request per V3 convention.
     """
+    request_cfg: Dict[str, Any] = {
+        "model_name": "bigmodel",
+        "enable_itn": True,
+        "enable_punc": True,
+        "enable_ddc": False,
+    }
+    hotwords_str = (settings.volcengine_hotwords or "").strip()
+    if hotwords_str:
+        hotwords_list = [w.strip() for w in hotwords_str.split(",") if w.strip()]
+        if hotwords_list:
+            request_cfg["hotwords"] = hotwords_list
+
     payload = {
         "user": {"uid": "interview-copilot"},
         "audio": {
@@ -56,12 +68,7 @@ def _build_full_client_request() -> bytes:
             "bits": 16,
             "channel": 1,
         },
-        "request": {
-            "model_name": "bigmodel",
-            "enable_itn": True,
-            "enable_punc": True,
-            "enable_ddc": False,
-        },
+        "request": request_cfg,
     }
     body = json.dumps(payload).encode("utf-8")
     compressed = gzip.compress(body)

@@ -4,6 +4,7 @@ import useInterviewStore from "../stores/interviewStore";
 export default function useWebSocket(sessionId) {
   const wsRef = useRef(null);
   const addTranscript = useInterviewStore((s) => s.addTranscript);
+  const updateTranscriptRefined = useInterviewStore((s) => s.updateTranscriptRefined);
   const appendSuggestions = useInterviewStore((s) => s.appendSuggestions);
   const setCurrentSpeaker = useInterviewStore((s) => s.setCurrentSpeaker);
   const setTranscriptionError = useInterviewStore((s) => s.setTranscriptionError);
@@ -35,6 +36,9 @@ export default function useWebSocket(sessionId) {
           case "transcript":
             setPartialTranscript(null);
             addTranscript(msg.payload);
+            break;
+          case "transcript_refined":
+            updateTranscriptRefined(msg.payload?.id, msg.payload?.text);
             break;
           case "transcript_partial":
             setPartialTranscript(msg.payload);
@@ -85,7 +89,7 @@ export default function useWebSocket(sessionId) {
       clearInterval(hb);
       ws.close();
     };
-  }, [sessionId, addTranscript, appendSuggestions, setCurrentSpeaker, setTranscriptionError, setPartialTranscript, setSttProvider, setSttHealthy, setWs, setCustomGuidanceActive]);
+  }, [sessionId, addTranscript, updateTranscriptRefined, appendSuggestions, setCurrentSpeaker, setTranscriptionError, setPartialTranscript, setSttProvider, setSttHealthy, setWs, setCustomGuidanceActive]);
 
   const sendAudio = useCallback((audioBlob) => {
     const ws = wsRef.current;

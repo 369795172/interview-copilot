@@ -206,6 +206,15 @@ class CopilotEngine:
         if speaker == "interviewer":
             self.asked_questions.append(text)
 
+    def update_last_transcript(self, speaker: str, merged_text: str) -> bool:
+        """Replace the last transcript with merged text. Returns True if updated."""
+        if not self.transcript_buffer:
+            return False
+        self.transcript_buffer[-1] = {"speaker": speaker, "text": merged_text}
+        if speaker == "interviewer" and self.asked_questions:
+            self.asked_questions[-1] = merged_text
+        return True
+
     def append_interviewer_memory(self, content: str):
         content = (content or "").strip()
         if not content:
