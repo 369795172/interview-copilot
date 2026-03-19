@@ -127,6 +127,34 @@ export default function useInterview() {
     return res.json();
   }, []);
 
+  const uploadRecording = useCallback(async (sessionId, blob) => {
+    const fd = new FormData();
+    const ext = blob.type === "audio/wav" ? ".wav" : ".webm";
+    fd.append("file", blob, `recording${ext}`);
+    const res = await fetch(`${API}/api/sessions/${sessionId}/audio/upload`, {
+      method: "POST",
+      body: fd,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || `Upload failed: ${res.status}`);
+    }
+    return res.json();
+  }, []);
+
+  const transcribeFromRecording = useCallback(async (sessionId, options = {}) => {
+    const { mode = "replace", defaultSpeaker = "candidate" } = options;
+    const params = new URLSearchParams({ mode, default_speaker: defaultSpeaker });
+    const res = await fetch(`${API}/api/sessions/${sessionId}/transcribe-from-recording?${params}`, {
+      method: "POST",
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || `Transcription failed: ${res.status}`);
+    }
+    return res.json();
+  }, []);
+
   return {
     createSession,
     startSession,
@@ -143,5 +171,7 @@ export default function useInterview() {
     importFeishu,
     importGitHub,
     uploadFile,
+    uploadRecording,
+    transcribeFromRecording,
   };
 }

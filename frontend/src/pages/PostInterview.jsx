@@ -1,21 +1,58 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import { Download, ArrowLeft, CheckCircle } from "lucide-react";
+import { Download, ArrowLeft, CheckCircle, Mic, Upload } from "lucide-react";
 import useInterview from "../hooks/useInterview";
 
 export default function PostInterview() {
   const { sessionId } = useParams();
   const navigate = useNavigate();
-  const { exportSession } = useInterview();
+  const { exportSession, transcribeFromRecording, uploadRecording } = useInterview();
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [transcribeLoading, setTranscribeLoading] = useState(false);
+  const [transcribeError, setTranscribeError] = useState(null);
+  const [uploading, setUploading] = useState(false);
 
-  useEffect(() => {
+  const loadResult = useCallback(() => {
+    setLoading(true);
     exportSession(sessionId)
       .then(setResult)
       .catch(() => {})
       .finally(() => setLoading(false));
   }, [sessionId, exportSession]);
+
+  useEffect(() => {
+    loadResult();
+  }, [loadResult]);
+
+  const handleTranscribeFromRecording = async () => {
+    setTranscribeError(null);
+    setTranscribeLoading(true);
+    try {
+      await transcribeFromRecording(sessionId, { mode: "replace", defaultSpeaker: "candidate" });
+      await loadResult();
+    } catch (e) {
+      setTranscribeError(e.message || "转写失败");
+    } finally {
+      setTranscribeLoading(false);
+    }
+  };
+
+  const handleFileUpload = async (e) => {
+    const file = e.target?.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    setTranscribeError(null);
+    try {
+      await uploadRecording(sessionId, file);
+      await handleTranscribeFromRecording();
+    } catch (err) {
+      setTranscribeError(err.message || "上传或转写失败");
+    } finally {
+      setUploading(false);
+      e.target.value = "";
+    }
+  };
 
   const handleDownload = () => {
     if (!result?.markdown) return;
@@ -38,17 +75,44 @@ export default function PostInterview() {
 
   return (
     <div style={{ maxWidth: 900, margin: "0 auto", padding: "2rem 1.5rem" }}>
-      <header style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1.5rem" }}>
+      <header style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1.5rem", flexWrap: "wrap", gap: "0.75rem" }}>
         <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
           <button className="btn btn-outline btn-sm" onClick={() => navigate("/")}>
             <ArrowLeft size={14} />
           </button>
           <h1 style={{ fontSize: "1.3rem", fontWeight: 700 }}>Interview Review</h1>
         </div>
-        <button className="btn btn-primary" onClick={handleDownload} disabled={!result?.markdown}>
-          <Download size={16} /> Export Markdown
-        </button>
+        <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", flexWrap: "wrap" }}>
+          <button
+            className="btn btn-outline btn-sm"
+            onClick={handleTranscribeFromRecording}
+            disabled={transcribeLoading || uploading}
+            title="用录音文件重新转写（高精度，替换当前转录）"
+          >
+            <Mic size={14} className={transcribeLoading ? "spin" : ""} />
+            {transcribeLoading ? " 转写中…" : " 从录音重新转写"}
+          </button>
+          <label className="btn btn-outline btn-sm" style={{ margin: 0, cursor: uploading ? "not-allowed" : "pointer" }}>
+            <Upload size={14} />
+            {uploading ? " 上传中…" : " 上传录音"}
+            <input
+              type="file"
+              accept="audio/wav,audio/webm,audio/mp3,.wav,.webm,.mp3"
+              onChange={handleFileUpload}
+              disabled={uploading}
+              style={{ display: "none" }}
+            />
+          </label>
+          <button className="btn btn-primary" onClick={handleDownload} disabled={!result?.markdown}>
+            <Download size={16} /> Export Markdown
+          </button>
+        </div>
       </header>
+      {transcribeError && (
+        <div className="card" style={{ marginBottom: "1rem", padding: "0.5rem 1rem", background: "rgba(225,112,85,0.1)", color: "var(--danger)" }}>
+          {transcribeError}
+        </div>
+      )}
 
       {loading && <p style={{ color: "var(--text-dim)" }}>Loading...</p>}
 

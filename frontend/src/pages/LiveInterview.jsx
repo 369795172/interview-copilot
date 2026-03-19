@@ -9,12 +9,12 @@ import useSettingsStore from "../stores/settingsStore";
 import TranscriptPanel from "../components/transcript/TranscriptPanel";
 import CopilotPanel from "../components/copilot/CopilotPanel";
 import ScoreCard from "../components/evaluation/ScoreCard";
-import { getLatestSession, getSessionChunks, hasReplayData } from "../lib/replayStore";
+import { exportSessionAsBlob, getLatestSession, getSessionChunks, hasReplayData } from "../lib/replayStore";
 
 export default function LiveInterview() {
   const { sessionId } = useParams();
   const navigate = useNavigate();
-  const { endSession, fetchCoverage, fetchTranscript, fetchHistory } = useInterview();
+  const { endSession, fetchCoverage, fetchTranscript, fetchHistory, uploadRecording } = useInterview();
   const { sendAudio, sendMessage } = useWebSocket(sessionId);
   const { isRecording, audioLevel, captureMode, startRecording, stopRecording } = useAudioStream(sendAudio, sessionId);
 
@@ -161,6 +161,11 @@ export default function LiveInterview() {
   const handleEnd = async () => {
     stopRecording();
     await endSession(sessionId);
+    exportSessionAsBlob(sessionId)
+      .then((blob) => {
+        if (blob) uploadRecording(sessionId, blob).catch((e) => console.warn("[LiveInterview] upload recording failed:", e));
+      })
+      .catch((e) => console.warn("[LiveInterview] export recording failed:", e));
     navigate(`/review/${sessionId}`);
   };
 

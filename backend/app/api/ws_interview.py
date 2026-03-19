@@ -77,6 +77,25 @@ def _pcm_is_silence(pcm: bytes, threshold: float = _SILENCE_ENERGY_THRESHOLD) ->
     return energy < threshold
 
 
+def _save_failed_audio_for_recovery(session_id: str, pcm_data: bytes, elapsed: float) -> None:
+    """Save failed transcription audio to session dir for later file-based recovery."""
+    if not pcm_data or len(pcm_data) < 1000:
+        return
+    try:
+        from pathlib import Path
+        from app.services.transcription import _pcm_to_wav
+
+        failed_dir = Path(settings.upload_dir) / session_id / "failed_chunks"
+        failed_dir.mkdir(parents=True, exist_ok=True)
+        ts = int(time.time() * 1000)
+        path = failed_dir / f"t{int(elapsed)}_ts{ts}.wav"
+        wav = _pcm_to_wav(pcm_data)
+        path.write_bytes(wav)
+        logger.info("Saved failed transcription audio for recovery: %s (%d bytes)", path, len(wav))
+    except Exception as e:
+        logger.warning("Could not save failed audio for recovery: %s", e)
+
+
 @router.websocket("/ws/interview/{session_id}")
 async def interview_ws(websocket: WebSocket, session_id: str):
     await websocket.accept()
@@ -173,6 +192,8 @@ async def interview_ws(websocket: WebSocket, session_id: str):
 
         meaningful_text = re.sub(r"[^A-Za-z0-9\u4e00-\u9fff]+", "", text)
         min_len = max(1, int(settings.ai_builder_min_text_length))
+        if settings.ai_builder_filter_relaxed:
+            min_len = min(min_len, 1)
         if len(meaningful_text) < min_len:
             logger.info(
                 "Filtered short AI Builder output (meaningful_len=%d): %s",
@@ -182,6 +203,8 @@ async def interview_ws(websocket: WebSocket, session_id: str):
             return None
 
         threshold = float(settings.ai_builder_confidence_threshold)
+        if settings.ai_builder_filter_relaxed:
+            threshold = min(threshold, 0.25)
         confidence = result.get("confidence")
         if confidence is not None:
             try:
@@ -202,7 +225,7 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                     segment_confidences.append(float(seg_conf))
             except (TypeError, ValueError):
                 continue
-        if segment_confidences:
+        if segment_confidences and not settings.ai_builder_filter_relaxed:
             avg_conf = sum(segment_confidences) / len(segment_confidences)
             min_conf = min(segment_confidences)
             if avg_conf < threshold and min_conf < max(0.05, threshold - 0.15):
@@ -266,6 +289,8 @@ async def interview_ws(websocket: WebSocket, session_id: str):
         elapsed = round(time.time() - session_start, 2)
         logger.debug("Flushing AI Builder buffer: %d bytes (t=%.1fs)", len(audio_snapshot), elapsed)
         result = await transcription_svc.transcribe(audio_snapshot)
+        if result.get("error"):
+            _save_failed_audio_for_recovery(session_id, audio_snapshot, elapsed)
         await _handle_ai_builder_result(result, elapsed)
 
     async def _silence_flush_timer():
@@ -745,11 +770,12 @@ async def interview_ws(websocket: WebSocket, session_id: str):
             volc_keepalive_task.cancel()
         if flush_timer_task and not flush_timer_task.done():
             flush_timer_task.cancel()
+        # Always flush/commit (even when stale) so data is persisted; new handler restores from DB
+        try:
+            await _commit_volc_partial_and_flush(speaker_state["current"])
+        except Exception:
+            logger.debug("Flush/commit on disconnect failed (websocket may be closed)", exc_info=True)
         if not _is_stale():
-            try:
-                await _flush_ai_builder_buf()
-            except Exception:
-                pass
             active_copilots.pop(session_id, None)
         if _active_ws.get(session_id) is websocket:
             _active_ws.pop(session_id, None)

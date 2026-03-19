@@ -4,12 +4,14 @@ Interview session CRUD routes.
 
 import json
 from datetime import datetime, timezone
-from typing import List
+from pathlib import Path
+from typing import List, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.database import get_db
 from app.models.db_models import (
     InterviewSession,
@@ -97,6 +99,86 @@ async def end_session(session_id: str, db: AsyncSession = Depends(get_db)):
     await db.commit()
     await db.refresh(s)
     return s
+
+
+@router.post("/{session_id}/audio/upload")
+async def upload_session_audio(
+    session_id: str,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Upload full recording for a session. Accepts WAV, MP3, OGG, WebM."""
+    s = await db.get(InterviewSession, session_id)
+    if not s:
+        raise HTTPException(404, "Session not found")
+
+    session_dir = Path(settings.upload_dir) / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    ext = Path(file.filename or "recording").suffix.lower() or ".wav"
+    if ext not in (".wav", ".mp3", ".ogg", ".webm", ".opus"):
+        ext = ".wav"
+    path = session_dir / f"recording{ext}"
+
+    try:
+        content = await file.read()
+        path.write_bytes(content)
+    except Exception as e:
+        raise HTTPException(500, f"Failed to save audio: {e}")
+
+    return {"ok": True, "path": str(path), "size": len(content)}
+
+
+@router.post("/{session_id}/transcribe-from-recording")
+async def transcribe_from_recording(
+    session_id: str,
+    mode: Literal["replace", "append"] = Query("replace", description="replace=clear existing; append=add to end"),
+    default_speaker: Literal["interviewer", "candidate"] = Query("candidate", description="Speaker for file ASR output (no diarization)"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Run file-based ASR on uploaded recording and merge into transcript."""
+    s = await db.get(InterviewSession, session_id)
+    if not s:
+        raise HTTPException(404, "Session not found")
+
+    session_dir = Path(settings.upload_dir) / session_id
+    candidates = list(session_dir.glob("recording.*")) if session_dir.exists() else []
+    if not candidates:
+        raise HTTPException(404, "No recording found. Upload via POST /audio/upload first.")
+
+    path = candidates[0]
+    audio_data = path.read_bytes()
+
+    from app.services.stt_file_volcengine import transcribe_file
+
+    result = await transcribe_file(audio_data)
+    if result.get("error"):
+        raise HTTPException(502, f"Transcription failed: {result['error']}")
+
+    utterances = result.get("utterances") or []
+    if not utterances and result.get("text"):
+        utterances = [{"start_time": 0, "end_time": result.get("duration_ms", 0), "text": result["text"]}]
+
+    if mode == "replace":
+        await db.execute(delete(TranscriptEntry).where(TranscriptEntry.session_id == session_id))
+        await db.commit()
+
+    for u in utterances:
+        start_sec = u.get("start_time", 0) / 1000.0
+        text = (u.get("text") or "").strip()
+        if not text:
+            continue
+        entry = TranscriptEntry(
+            session_id=session_id,
+            speaker=default_speaker,
+            text=text,
+            start_time=start_sec,
+            end_time=u.get("end_time") / 1000.0 if u.get("end_time") else None,
+        )
+        db.add(entry)
+    await db.commit()
+
+    return {"ok": True, "entries_added": len(utterances), "mode": mode}
 
 
 @router.get("/{session_id}/transcript", response_model=List[TranscriptEntryOut])

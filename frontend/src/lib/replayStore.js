@@ -163,3 +163,71 @@ export async function hasReplayData() {
   const latest = await getLatestSession();
   return latest !== null;
 }
+
+const WEBM_MAGIC = new Uint8Array([0x1a, 0x45, 0xdf, 0xa3]);
+
+function isWebM(buffer) {
+  if (!buffer || buffer.byteLength < 4) return false;
+  const view = new Uint8Array(buffer);
+  return WEBM_MAGIC.every((b, i) => view[i] === b);
+}
+
+function pcmToWav(pcmData, sampleRate = 16000, numChannels = 1, bitsPerSample = 16) {
+  const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+  const blockAlign = numChannels * (bitsPerSample / 8);
+  const dataSize = pcmData.byteLength;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+  const writeStr = (offset, str) => {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  };
+  writeStr(0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeStr(8, "WAVE");
+  writeStr(12, "fmt ");
+  view.setUint32(16, 16, true); // chunk size
+  view.setUint16(20, 1, true);  // PCM
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bitsPerSample, true);
+  writeStr(36, "data");
+  view.setUint32(40, dataSize, true);
+  new Uint8Array(buffer).set(new Uint8Array(pcmData), 44);
+  return buffer;
+}
+
+/**
+ * Export session chunks as a single Blob for upload.
+ * PCM chunks -> WAV; WebM chunks -> concatenated WebM.
+ */
+export async function exportSessionAsBlob(sessionId) {
+  const chunks = await getSessionChunks(sessionId);
+  if (chunks.length === 0) return null;
+
+  const first = chunks[0]?.payload;
+  if (!first) return null;
+
+  if (isWebM(first)) {
+    const parts = chunks.map((c) => c.payload);
+    const total = parts.reduce((acc, p) => acc + p.byteLength, 0);
+    const combined = new Uint8Array(total);
+    let offset = 0;
+    for (const p of parts) {
+      combined.set(new Uint8Array(p), offset);
+      offset += p.byteLength;
+    }
+    return new Blob([combined], { type: "audio/webm" });
+  }
+
+  const total = chunks.reduce((acc, c) => acc + c.payload.byteLength, 0);
+  const pcm = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    pcm.set(new Uint8Array(c.payload), off);
+    off += c.payload.byteLength;
+  }
+  const wav = pcmToWav(pcm.buffer, 16000, 1, 16);
+  return new Blob([wav], { type: "audio/wav" });
+}

@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     ai_builder_base_url: str = "https://space.ai-builders.com/backend/v1"
     ai_builder_confidence_threshold: float = 0.4
     ai_builder_min_text_length: int = 3
+    ai_builder_filter_relaxed: bool = False  # If True, use looser thresholds to reduce text loss
     ai_builder_prompt: str = (
         "这是一段技术面试对话录音。请只转写说话内容，不要描述噪音、设备状态或环境。"
         "规则：1) 保持原意，不回答或解释问题；2) 保留技术术语、产品名、框架名；"
