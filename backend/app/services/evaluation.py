@@ -3,7 +3,9 @@ Evaluation engine.
 Manages multi-dimensional scoring, evidence linking, and export.
 """
 
+import asyncio
 import logging
+import re
 from typing import List, Dict, Any, Optional
 
 from sqlalchemy import select
@@ -13,6 +15,9 @@ from app.models.db_models import EvaluationScore, TranscriptEntry
 from app.services.copilot import DEFAULT_EVALUATION_FRAMEWORK, CopilotEngine
 
 logger = logging.getLogger(__name__)
+
+# Max transcript entries to pass to LLM (token limit mitigation)
+MAX_TRANSCRIPT_ENTRIES = 150
 
 
 class EvaluationEngine:
@@ -61,36 +66,101 @@ class EvaluationEngine:
         pct = round(total_weighted / max_weighted * 100, 1) if max_weighted else 0
         return {"coverage": coverage, "gaps": gaps, "weighted_total": round(total_weighted / max_weighted * 100) if max_weighted else 0, "completion_pct": pct}
 
+    @staticmethod
+    def _match_key_evidence_to_ids(
+        key_evidence: List[str],
+        entries: List[TranscriptEntry],
+    ) -> List[str]:
+        """Match LLM key_evidence strings to transcript entry ids via fuzzy text matching."""
+        if not key_evidence or not entries:
+            return []
+        ids: List[str] = []
+        seen: set = set()
+
+        def normalize(s: str) -> str:
+            return re.sub(r"\s+", " ", (s or "").strip())
+
+        for ev_str in key_evidence:
+            norm_ev = normalize(ev_str)
+            if not norm_ev or len(norm_ev) < 3:
+                continue
+            for e in entries:
+                if e.id in seen:
+                    continue
+                norm_text = normalize(e.text)
+                if not norm_text:
+                    continue
+                # Match: key_evidence contains entry text, or entry text contains key_evidence
+                if norm_ev in norm_text or norm_text in norm_ev or norm_ev[:20] in norm_text:
+                    ids.append(e.id)
+                    seen.add(e.id)
+                    break
+        return ids
+
     async def suggest_scores(
         self,
         db: AsyncSession,
         session_id: str,
         copilot: CopilotEngine,
     ) -> List[Dict[str, Any]]:
-        """Ask copilot to suggest scores for dimensions with evidence but no score."""
-        result = await db.execute(
+        """Ask copilot to suggest scores for unscored dimensions using full transcript."""
+        # Fetch full transcript
+        tr_result = await db.execute(
+            select(TranscriptEntry)
+            .where(TranscriptEntry.session_id == session_id)
+            .order_by(TranscriptEntry.start_time)
+        )
+        entries = tr_result.scalars().all()
+        if not entries:
+            logger.info("suggest_scores: no transcript for session %s", session_id)
+            return []
+
+        # Token limit mitigation: truncate if too long
+        if len(entries) > MAX_TRANSCRIPT_ENTRIES:
+            entries = entries[-MAX_TRANSCRIPT_ENTRIES:]
+            logger.info("suggest_scores: truncated transcript to last %d entries", MAX_TRANSCRIPT_ENTRIES)
+
+        evidence = [f"[{e.speaker}] {e.text}" for e in entries]
+
+        # Get already-scored dimensions
+        scored_result = await db.execute(
             select(EvaluationScore).where(
                 EvaluationScore.session_id == session_id,
-                EvaluationScore.score.is_(None),
+                EvaluationScore.score.is_not(None),
             )
         )
-        unsored = result.scalars().all()
-        suggestions = []
-        for ev in unsored:
-            if not ev.transcript_entry_ids:
-                continue
-            tr_result = await db.execute(
-                select(TranscriptEntry).where(TranscriptEntry.id.in_(ev.transcript_entry_ids))
-            )
-            entries = tr_result.scalars().all()
-            evidence = [f"[{e.speaker}] {e.text}" for e in entries]
-            suggestion = await copilot.suggest_score(ev.dimension, ev.sub_dimension or "", evidence)
-            suggestions.append({
-                "dimension": ev.dimension,
-                "sub_dimension": ev.sub_dimension,
-                "evaluation_id": ev.id,
-                **suggestion,
-            })
+        scored = {(s.dimension, s.sub_dimension or "") for s in scored_result.scalars().all()}
+
+        tasks = [
+            (dim["name"], sub["name"])
+            for dim in self.framework["dimensions"]
+            for sub in dim["sub_dimensions"]
+            if (dim["name"], sub["name"]) not in scored
+        ]
+
+        async def _suggest_one(d: str, s: str) -> Dict[str, Any]:
+            suggestion = await copilot.suggest_score(d, s, evidence)
+            key_evidence = suggestion.get("key_evidence") or []
+            transcript_entry_ids = self._match_key_evidence_to_ids(key_evidence, entries)
+            return {
+                "dimension": d,
+                "sub_dimension": s,
+                "suggested_score": suggestion.get("suggested_score"),
+                "reasoning": suggestion.get("reasoning", ""),
+                "key_evidence": key_evidence,
+                "transcript_entry_ids": transcript_entry_ids,
+            }
+
+        results = await asyncio.gather(
+            *[_suggest_one(d, s) for d, s in tasks],
+            return_exceptions=True,
+        )
+        suggestions: List[Dict[str, Any]] = []
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                logger.warning("suggest_scores: dimension %s failed: %s", tasks[i] if i < len(tasks) else i, r)
+            else:
+                suggestions.append(r)
         return suggestions
 
     def compute_decision(self, scores: List[Dict[str, Any]]) -> Dict[str, Any]:

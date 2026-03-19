@@ -432,7 +432,7 @@ export default function LiveInterview() {
             overflow: "hidden",
           }}
         >
-          <ScoreCard sessionId={sessionId} transcript={transcript} />
+          <ScoreCard sessionId={sessionId} transcript={transcript} autoRefresh={true} />
         </div>
       </div>
     </div>
